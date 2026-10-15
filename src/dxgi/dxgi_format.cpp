@@ -857,18 +857,28 @@ namespace dxvk {
   }};
   
   
-  DXGIVkFormatTable::DXGIVkFormatTable(const Rc<DxvkDevice>& device)
+  DXGIVkFormatTable::DXGIVkFormatTable(const Rc<DxvkDevice>& device, uint32_t depthBits)
   : m_dxgiFormats (g_dxgiFormats), m_dxgiFamilies(g_dxgiFamilies) {
     // AMD do not support 24-bit depth buffers on Vulkan,
     // so we have to fall back to a 32-bit depth format.
-    if (!CheckImageFormatSupport(device, VK_FORMAT_D24_UNORM_S8_UINT,
+    bool useD24 = depthBits != 32 && CheckImageFormatSupport(device, VK_FORMAT_D24_UNORM_S8_UINT,
           VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
-          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
+          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
+    if (!useD24) {
       Logger::info("DXGI: VK_FORMAT_D24_UNORM_S8_UINT -> VK_FORMAT_D32_SFLOAT_S8_UINT");
       RemapDepthFormat(DXGI_FORMAT_R24G8_TYPELESS,        VK_FORMAT_D32_SFLOAT_S8_UINT);
       RemapDepthFormat(DXGI_FORMAT_R24_UNORM_X8_TYPELESS, VK_FORMAT_D32_SFLOAT_S8_UINT);
       RemapDepthFormat(DXGI_FORMAT_X24_TYPELESS_G8_UINT,  VK_FORMAT_D32_SFLOAT_S8_UINT);
       RemapDepthFormat(DXGI_FORMAT_D24_UNORM_S8_UINT,     VK_FORMAT_D32_SFLOAT_S8_UINT);
+    }
+
+    if (depthBits) {
+      VkFormat target = useD24 ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT;
+      for (auto format : { DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_FLOAT,
+                          DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM })
+        RemapDepthFormat(format, target);
+      Logger::info(str::format("D7VK: DXGI internal depth precision ", depthBits,
+        " bits; D16 -> ", target));
     }
 
     if (!CheckImageFormatSupport(device, VK_FORMAT_A8_UNORM_KHR,

@@ -1,3 +1,4 @@
+#include "../dxvk/dxvk_resolution.h"
 #include "d3d9_device.h"
 
 #include "d3d9_annotation.h"
@@ -21,6 +22,7 @@
 
 #include "../util/util_bit.h"
 #include "../util/util_math.h"
+#include "../util/config/graphics_filter.h"
 
 #include "d3d9_initializer.h"
 
@@ -1051,7 +1053,7 @@ namespace dxvk {
     if (unlikely(srcTexInfo->Desc()->Pool != D3DPOOL_SYSTEMMEM || dstTexInfo->Desc()->Pool != D3DPOOL_DEFAULT))
       return D3DERR_INVALIDCALL;
 
-    if (unlikely(srcTexInfo->Desc()->MipLevels < dstTexInfo->Desc()->MipLevels && !dstTexInfo->IsAutomaticMip()))
+    if (unlikely(srcTexInfo->ExposedMipLevels() < dstTexInfo->ExposedMipLevels()))
       return D3DERR_INVALIDCALL;
 
     if (unlikely(dstTexInfo->Desc()->Format != srcTexInfo->Desc()->Format))
@@ -1061,8 +1063,8 @@ namespace dxvk {
       return D3DERR_INVALIDCALL;
 
     const Rc<DxvkImage> dstImage  = dstTexInfo->GetImage();
-    uint32_t srcMipLevels = srcTexInfo->IsAutomaticMip() ? 1 : srcTexInfo->Desc()->MipLevels;
-    uint32_t dstMipLevels = dstTexInfo->IsAutomaticMip() ? 1 : dstTexInfo->Desc()->MipLevels;
+    uint32_t srcMipLevels = srcTexInfo->ExposedMipLevels();
+    uint32_t dstMipLevels = dstTexInfo->ExposedMipLevels();
     uint32_t arraySlices = std::min(srcTexInfo->Desc()->ArraySize, dstTexInfo->Desc()->ArraySize);
 
     uint32_t srcMipOffset = 0;
@@ -1077,7 +1079,7 @@ namespace dxvk {
         // If the largest mip maps don't match in size, we try to take the smallest ones
         // of the source.
 
-        srcMipOffset = srcTexInfo->Desc()->MipLevels - dstMipLevels;
+        srcMipOffset = srcMipLevels - dstMipLevels;
         srcFirstMipExtent = util::computeMipLevelExtent(srcTexInfo->GetExtent(), srcMipOffset);
         dstFirstMipExtent = dstTexInfo->GetExtent();
       }
@@ -1187,6 +1189,16 @@ namespace dxvk {
       srcSubresource.mipLevel,
       srcSubresource.arrayLayer, 1 };
 
+    if (srcTexInfo->IsScaled() || srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      auto mapping = srcTexInfo->GetMappingImage();
+      EmitCs([cSource = srcImage, cMapping = mapping, cLayers = srcSubresourceLayers,
+              cLogicalExtent = srcTexExtent] (DxvkContext* ctx) {
+        BlitResolutionImage(ctx, cMapping, cSource, cLayers, {0, 0, 0}, cLogicalExtent,
+          {0, 0, 0}, cSource->mipLevelExtent(cLayers.mipLevel));
+      });
+      srcImage = mapping;
+    }
+
     EmitCs([
       cBufferSlice  = std::move(dstBufferSlice),
       cImage        = srcImage,
@@ -1289,6 +1301,15 @@ namespace dxvk {
     blitInfo.srcOffsets[1] = pSourceRect != nullptr
       ? VkOffset3D{ int32_t(pSourceRect->right), int32_t(pSourceRect->bottom), 1 }
       : VkOffset3D{ int32_t(srcExtent.width),    int32_t(srcExtent.height),    1 };
+
+    if (pSourceRect) {
+      blitInfo.srcOffsets[0] = srcTextureInfo->ScaleOffset(blitInfo.srcOffsets[0], srcSubresource.mipLevel);
+      blitInfo.srcOffsets[1] = srcTextureInfo->ScaleOffset(blitInfo.srcOffsets[1], srcSubresource.mipLevel);
+    }
+    if (pDestRect) {
+      blitInfo.dstOffsets[0] = dstTextureInfo->ScaleOffset(blitInfo.dstOffsets[0], dstSubresource.mipLevel);
+      blitInfo.dstOffsets[1] = dstTextureInfo->ScaleOffset(blitInfo.dstOffsets[1], dstSubresource.mipLevel);
+    }
 
     if (unlikely(IsBlitRegionInvalid(blitInfo.srcOffsets, srcExtent)))
       return D3DERR_INVALIDCALL;
@@ -1459,10 +1480,20 @@ namespace dxvk {
         cBlitInfo = blitInfo,
         cFilter   = stretch ? DecodeFilter(Filter) : VK_FILTER_NEAREST
       ] (DxvkContext* ctx) {
-        ctx->blitImageView(
-          cDstView, cBlitInfo.dstOffsets,
-          cSrcView, cBlitInfo.srcOffsets,
-          cFilter);
+        if (cBlitInfo.dstSubresource.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+          VkExtent3D dstExtent = { uint32_t(cBlitInfo.dstOffsets[1].x - cBlitInfo.dstOffsets[0].x),
+            uint32_t(cBlitInfo.dstOffsets[1].y - cBlitInfo.dstOffsets[0].y), 1 };
+          VkExtent3D srcExtent = { uint32_t(cBlitInfo.srcOffsets[1].x - cBlitInfo.srcOffsets[0].x),
+            uint32_t(cBlitInfo.srcOffsets[1].y - cBlitInfo.srcOffsets[0].y), 1 };
+          ctx->blitResolutionImage(cDstView->image(), cSrcView->image(),
+            cBlitInfo.dstSubresource, cBlitInfo.dstOffsets[0], dstExtent,
+            cBlitInfo.srcSubresource, cBlitInfo.srcOffsets[0], srcExtent);
+        } else {
+          ctx->blitImageView(
+            cDstView, cBlitInfo.dstOffsets,
+            cSrcView, cBlitInfo.srcOffsets,
+            cFilter);
+        }
       });
     }
 
@@ -1501,6 +1532,8 @@ namespace dxvk {
 
     if (pRect != nullptr)
       ConvertRect(*pRect, offset, extent);
+
+    dstTextureInfo->ScaleRegion(offset, extent, dst->GetMipLevel());
 
     VkClearValue clearValue = { };
     DecodeD3DCOLOR(Color, clearValue.color.float32);
@@ -1957,10 +1990,13 @@ namespace dxvk {
       uint32_t                 alignment,
       VkOffset3D               offset,
       VkExtent3D               extent,
+      D3D9Surface*             surface,
       const Rc<DxvkImageView>& imageView,
       VkImageAspectFlags       aspectMask,
       VkClearValue             clearValue) {
 
+      surface->GetCommonTexture()->ScaleRegion(offset, extent, surface->GetMipLevel());
+      surface->GetCommonTexture()->MarkSampleResolveDirty();
       VkExtent3D imageExtent = imageView->mipLevelExtent(0);
       extent.width = std::min(imageExtent.width, extent.width);
       extent.height = std::min(imageExtent.height, extent.height);
@@ -2009,7 +2045,7 @@ namespace dxvk {
       VkExtent3D         extent) {
       // Clear depth if we need to.
       if (depthAspectMask != 0)
-        ClearImageView(alignment, offset, extent, m_state.depthStencil->GetDepthStencilView(true), depthAspectMask, clearValueDepth);
+        ClearImageView(alignment, offset, extent, m_state.depthStencil.ptr(), m_state.depthStencil->GetDepthStencilView(true), depthAspectMask, clearValueDepth);
 
       // Clear render targets if we need to.
       if (Flags & D3DCLEAR_TARGET) {
@@ -2020,7 +2056,7 @@ namespace dxvk {
           const auto& rtv = rts->GetRenderTargetView(srgb);
 
           if (likely(rtv != nullptr)) {
-            ClearImageView(alignment, offset, extent, rtv, VK_IMAGE_ASPECT_COLOR_BIT, clearValueColor);
+            ClearImageView(alignment, offset, extent, rts.ptr(), rtv, VK_IMAGE_ASPECT_COLOR_BIT, clearValueColor);
 
             D3D9CommonTexture* dstTexture = rts->GetCommonTexture();
 
@@ -5007,11 +5043,10 @@ namespace dxvk {
     }
 
     auto& formatMapping = pResource->GetFormatMapping();
-    const DxvkFormatInfo* formatInfo = formatMapping.IsValid()
-      ? lookupFormatInfo(formatMapping.Format) : UnsupportedFormatInfo(pResource->Desc()->Format);
+    const DxvkFormatInfo* formatInfo = pResource->GetPackedFormatInfo();
 
     auto subresource = pResource->GetSubresourceFromIndex(
-        formatInfo->aspectMask, Subresource);
+        formatMapping.Aspect, Subresource);
 
     VkExtent3D levelExtent = pResource->GetExtentMip(MipLevel);
     VkExtent3D blockCount  = util::computeBlockCount(levelExtent, formatInfo->blockSize);
@@ -5086,8 +5121,7 @@ namespace dxvk {
         auto subresourceLayers = vk::makeSubresourceLayers(subresource);
 
         // In D3D7 and earlier we may need to lock multisampled depth/render targets
-        if (unlikely(resourceImage->info().sampleCount != 1
-                  && m_d3dCompatibility.test(D3DCompatibility::D3D7))) {
+        if (unlikely(resourceImage->info().sampleCount != 1)) {
           mappedImage = pResource->GetResolveImage();
 
           EmitCs([
@@ -5106,6 +5140,16 @@ namespace dxvk {
 
             ctx->resolveImage(cResolveImage, cMainImage, region, format,
               getDefaultResolveMode(format), VK_RESOLVE_MODE_SAMPLE_ZERO_BIT);
+          });
+        }
+
+        if (pResource->IsScaled()) {
+          Rc<DxvkImage> source = mappedImage ? mappedImage : resourceImage;
+          mappedImage = pResource->GetMappingImage();
+          EmitCs([cSource = source, cMapped = mappedImage, cLayers = subresourceLayers,
+                  cLogicalExtent = levelExtent] (DxvkContext* ctx) {
+            BlitResolutionImage(ctx, cMapped, cSource, cLayers, {0, 0, 0}, cLogicalExtent,
+              {0, 0, 0}, cSource->mipLevelExtent(cLayers.mipLevel));
           });
         }
 
@@ -5289,13 +5333,16 @@ namespace dxvk {
     // Wait until the amount of used staging memory is under a certain threshold to avoid using
     // too much memory and even more so to avoid using too much address space.
     ThrottleAllocation();
+    pDestTexture->MarkSampleResolveDirty();
 
-    const Rc<DxvkImage> image = pDestTexture->GetImage();
+    const Rc<DxvkImage> renderImage = pDestTexture->GetImage();
+    const bool staged = pDestTexture->IsScaled() || renderImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
+    const Rc<DxvkImage> image = staged ? pDestTexture->GetMappingImage() : renderImage;
 
     // Now that data has been written into the buffer,
     // we need to copy its contents into the image
 
-    auto formatInfo = lookupFormatInfo(pDestTexture->GetFormatMapping().Format);
+    auto formatInfo = pSrcTexture->GetPackedFormatInfo();
     auto srcSubresource = pSrcTexture->GetSubresourceFromIndex(
       formatInfo->aspectMask, SrcSubresource);
 
@@ -5374,6 +5421,18 @@ namespace dxvk {
           0, 0, cPackedDSFormat);
       });
 
+      if (staged) {
+        VkOffset3D renderOffset = alignedDestOffset;
+        VkExtent3D renderExtent = alignedExtent;
+        pDestTexture->ScaleRegion(renderOffset, renderExtent, dstLayers.mipLevel);
+        EmitCs([cRender = renderImage, cMapping = image, cLayers = dstLayers,
+                cRenderOffset = renderOffset, cRenderExtent = renderExtent,
+                cOffset = alignedDestOffset, cExtent = alignedExtent] (DxvkContext* ctx) {
+          BlitResolutionImage(ctx, cRender, cMapping, cLayers,
+            cRenderOffset, cRenderExtent, cOffset, cExtent);
+        });
+      }
+
       TrackTextureMappingBufferSequenceNumber(pSrcTexture, SrcSubresource);
     }
     else {
@@ -5414,7 +5473,7 @@ namespace dxvk {
 
       EmitCs([this,
         cConvertFormat    = convertFormat,
-        cDstImage         = std::move(image),
+        cDstImage         = image,
         cDstLayers        = convertedDstLayers,
         cSrcSlice         = std::move(slice.slice)
       ] (DxvkContext* ctx) {
@@ -5423,9 +5482,37 @@ namespace dxvk {
         m_converter->ConvertFormat(contextObjects,
           cConvertFormat, cDstImage, cDstLayers, cSrcSlice);
       });
+      if (staged) {
+        EmitCs([cRender = renderImage, cMapping = image, cLayers = convertedDstLayers] (DxvkContext* ctx) {
+          BlitResolutionImage(ctx, cRender, cMapping, cLayers,
+            {0, 0, 0}, cRender->mipLevelExtent(cLayers.mipLevel),
+            {0, 0, 0}, cMapping->mipLevelExtent(cLayers.mipLevel));
+        });
+      }
     }
     UnmapTextures();
     ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+  }
+
+
+  void D3D9DeviceEx::EmitResolveTextureSamples(
+    D3D9CommonTexture* pResource) {
+    if (!pResource->NeedsSampleResolve())
+      return;
+
+    EmitCs([
+      cSrc = pResource->GetImage(),
+      cDst = pResource->GetResolveImage(),
+      cAspects = pResource->GetFormatMapping().Aspect
+    ] (DxvkContext* ctx) {
+      VkImageResolve region = {};
+      region.srcSubresource = { cAspects, 0u, 0u, cSrc->info().numLayers };
+      region.dstSubresource = region.srcSubresource;
+      region.extent = cSrc->info().extent;
+      ctx->resolveImage(cDst, cSrc, region, cSrc->info().format,
+        getDefaultResolveMode(cSrc->info().format), VK_RESOLVE_MODE_SAMPLE_ZERO_BIT);
+    });
+    pResource->MarkSampleResolved();
   }
 
 
@@ -5434,9 +5521,21 @@ namespace dxvk {
     if (pResource->IsManaged())
       UploadManagedTexture(pResource);
 
+    // Explicit GenerateMipSubLevels calls must see the latest render, too.
+    EmitResolveTextureSamples(pResource);
+
+    D3DTEXTUREFILTERTYPE filter = pResource->GetMipFilter();
+    if (m_d3d9Options.graphics.generatesMipmaps())
+      filter = m_d3d9Options.graphics.mipmapping == GraphicsMipmaps::Point
+        ? D3DTEXF_POINT : D3DTEXF_LINEAR;
+
     EmitCs([
-      cImageView = pResource->GetSampleView(false),
-      cFilter    = pResource->GetMipFilter()
+      cImageView = pResource->HasForcedMipMaps()
+        ? pResource->CreateView(D3D9CommonTexture::AllLayers,
+            pResource->MipGenerationSourceLevel(), VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, false)
+        : pResource->GetSampleView(false),
+      cFilter    = filter
     ] (DxvkContext* ctx) {
       ctx->generateMipmaps(cImageView, DecodeFilter(cFilter));
     });
@@ -6707,6 +6806,15 @@ namespace dxvk {
 
     const auto& psMasks = PSShaderMasks();
 
+    auto warnSampleMismatch = [this] {
+      if (m_d3d9Options.graphics.msaa > 0) {
+        static std::atomic<bool> warned = false;
+        if (!warned.exchange(true))
+          Logger::warn("D7VK: Forced MSAA produced incompatible attachment sample counts; "
+            "the incompatible attachment is omitted; use application-driven MSAA for this application");
+      }
+    };
+
     VkSampleCountFlags sampleCount = VK_SAMPLE_COUNT_1_BIT;
     VkExtent2D renderArea = { 0u, 0u };
     const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
@@ -6743,6 +6851,8 @@ namespace dxvk {
         || dsInfo.extent.height < renderArea.height
         || dsInfo.sampleCount != sampleCount;
       const bool bindDS = !mismatch || noRT0Bound || ignoreRT0;
+      if (!bindDS && dsInfo.sampleCount != sampleCount)
+        warnSampleMismatch();
 
       if (likely(bindDS)) {
         if (unlikely(noRT0Bound || ignoreRT0)) {
@@ -6771,6 +6881,8 @@ namespace dxvk {
 
       const D3D9CommonTexture* rt = m_state.renderTargets[i]->GetCommonTexture();
       const DxvkImageCreateInfo& rtInfo = rt->GetImage()->info();
+      if (rtInfo.sampleCount != sampleCount)
+        warnSampleMismatch();
       if (unlikely(rtInfo.extent.width != renderArea.width
           || rtInfo.extent.height != renderArea.height
           || rtInfo.sampleCount != sampleCount))
@@ -6884,6 +6996,30 @@ namespace dxvk {
         VkExtent2D { vp.Width,      vp.Height     }};
     }
 
+    if (auto* target = m_state.renderTargets[0].ptr()) {
+      auto* texture = target->GetCommonTexture();
+      if (texture->IsScaled()) {
+        auto logical = texture->GetExtentMip(target->GetMipLevel());
+        auto physical = texture->GetImage()->mipLevelExtent(target->GetMipLevel());
+        float sx = float(physical.width) / logical.width;
+        float sy = float(physical.height) / logical.height;
+        state.viewport.x *= sx;
+        state.viewport.y *= sy;
+        state.viewport.width *= sx;
+        state.viewport.height *= sy;
+        VkOffset3D offset = { state.scissor.offset.x, state.scissor.offset.y, 0 };
+        VkExtent3D extent = { state.scissor.extent.width, state.scissor.extent.height, 1 };
+        texture->ScaleRegion(offset, extent, target->GetMipLevel());
+        state.scissor = { { offset.x, offset.y }, { extent.width, extent.height } };
+      }
+    }
+
+    if (m_d3d9Options.graphics.scalesResolution() && !m_loggedRenderViewport && vp.Width && vp.Height) {
+      Logger::info(str::format("D7VK: Raster viewport ", vp.Width, "x", vp.Height,
+        " logical -> ", state.viewport.width, "x", -state.viewport.height, " physical"));
+      m_loggedRenderViewport = true;
+    }
+
     EmitCs([
       cViewport = state
     ] (DxvkContext* ctx) {
@@ -6908,10 +7044,8 @@ namespace dxvk {
 
       // Check sample count of RT 0
       const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
-      const bool isMultisampled = rt0 != nullptr && (
-        rt0->Desc()->MultiSample >= D3DMULTISAMPLE_2_SAMPLES
-        || (rt0->Desc()->MultiSample == D3DMULTISAMPLE_NONMASKABLE && rt0->Desc()->MultisampleQuality > 0)
-      );
+      const bool isMultisampled = rt0 != nullptr
+        && rt0->GetImage()->info().sampleCount > VK_SAMPLE_COUNT_1_BIT;
       alphaToCoverageEnabled &= isMultisampled;
 
       if (m_atocEnabled != alphaToCoverageEnabled) {
@@ -7092,7 +7226,9 @@ namespace dxvk {
     state.setFrontFace(VK_FRONT_FACE_CLOCKWISE);
     state.setPolygonMode(DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE])));
     state.setFlatShading(m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT);
-    state.setSampleCount(m_state.renderStates[D3DRS_MULTISAMPLEANTIALIAS]
+    bool multisample = m_d3d9Options.graphics.msaa >= 0
+      ? m_d3d9Options.graphics.msaa > 0 : bool(m_state.renderStates[D3DRS_MULTISAMPLEANTIALIAS]);
+    state.setSampleCount(multisample
       ? VkSampleCountFlags(0u)
       : VkSampleCountFlags(VK_SAMPLE_COUNT_1_BIT));
 
@@ -7209,10 +7345,33 @@ namespace dxvk {
     ] (DxvkContext* ctx) {
       DxvkSamplerKey key = { };
 
+      uint32_t anisotropy = cState.minFilter == D3DTEXF_ANISOTROPIC
+        ? cState.maxAnisotropy : 0u;
+      if (m_d3d9Options.samplerAnisotropy != -1 && cState.minFilter > D3DTEXF_POINT)
+        anisotropy = m_d3d9Options.samplerAnisotropy;
+
+      const auto filter = applyGraphicsSamplerFilter(m_d3d9Options.graphics, {
+        DecodeFilter(cState.minFilter) == VK_FILTER_LINEAR,
+        DecodeFilter(cState.magFilter) == VK_FILTER_LINEAR,
+        DecodeMipFilter(cState.mipFilter) == VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        cState.mipFilter != D3DTEXF_NONE, anisotropy });
+
+      if (cBindId == 1 && m_d3d9Options.graphics.filtering != GraphicsFilter::App)
+        Logger::debug(str::format("D7VK: D3D9 filtering override=",
+          uint32_t(m_d3d9Options.graphics.filtering), ", anisotropy=",
+          m_d3d9Options.graphics.anisotropy, ", preserve point=",
+          m_d3d9Options.graphics.keepPointFiltering));
+
       key.setFilter(
-        DecodeFilter(cState.minFilter),
-        DecodeFilter(cState.magFilter),
-        DecodeMipFilter(cState.mipFilter));
+        filter.minLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        filter.magLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        filter.mipLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST);
+
+      // Forced anisotropic filtering also improves single-level textures;
+      // preserve upstream sampler behaviour when the override is disabled.
+      if ((cIsMultiMip && filter.mipEnabled)
+       || m_d3d9Options.graphics.filtering == GraphicsFilter::Anisotropic)
+        key.setAniso(filter.anisotropy);
 
       if (cIsCube) {
         key.setAddressModes(
@@ -7233,15 +7392,7 @@ namespace dxvk {
       if (!cIsMultiMip) {
         // For some reason, using the 0.0 - 0.0 range breaks linear filtering in some cases
         key.setLodRange(0.0f, 1.0f, 0.0f);
-      } else if (cState.mipFilter) {
-        uint32_t anisotropy = cState.minFilter == D3DTEXF_ANISOTROPIC
-          ? cState.maxAnisotropy : 0u;
-
-        if (m_d3d9Options.samplerAnisotropy != -1 && cState.minFilter > D3DTEXF_POINT)
-          anisotropy = m_d3d9Options.samplerAnisotropy;
-
-        key.setAniso(anisotropy);
-
+      } else if (filter.mipEnabled) {
         float lodBias = cState.mipLodBias;
         lodBias += m_d3d9Options.samplerLodBias;
 
@@ -7378,6 +7529,20 @@ namespace dxvk {
     const uint32_t texturesToUpload = m_textureSlotTracking.needsUpload & usedTextureMask;
     if (unlikely(texturesToUpload != 0))
       UploadManagedTextures(texturesToUpload);
+
+    // Resolve only changed, sampled render textures. Keep their descriptors
+    // and shader resource types single-sample while rendering with forced AA.
+    // Doing this before the draw also handles a texture that remains bound
+    // while the application switches between rendering and sampling it.
+    const uint32_t resolveMask = m_d3d9Options.graphics.msaa > 0 ? usedTextureMask : 0u;
+    for (uint32_t index : bit::BitMask(resolveMask)) {
+      auto texture = GetCommonTexture(m_state.textures[index]);
+      if (!texture->NeedsSampleResolve())
+        continue;
+      EmitResolveTextureSamples(texture);
+      if (texture->IsAutomaticMip())
+        MarkTextureMipsDirty(texture);
+    }
 
     const uint32_t texturesToGen = m_textureSlotTracking.needsMipGen & usedTextureMask;
     if (unlikely(texturesToGen != 0))
@@ -7537,6 +7702,17 @@ namespace dxvk {
       UpdatePushData();
 
     ApplyPrimitiveType(PrimitiveType);
+
+    // The upcoming draw can modify any currently bound attachment. Copies,
+    // uploads and clears mark this independently of the draw path.
+    if (m_d3d9Options.graphics.msaa > 0) {
+      for (const auto& target : m_state.renderTargets) {
+        if (target)
+          target->GetCommonTexture()->MarkSampleResolveDirty();
+      }
+      if (m_state.depthStencil)
+        m_state.depthStencil->GetCommonTexture()->MarkSampleResolveDirty();
+    }
   }
 
 
@@ -8527,8 +8703,9 @@ namespace dxvk {
     const D3D9_COMMON_TEXTURE_DESC* srcDesc = srcTextureInfo->Desc();
     const D3D9_COMMON_TEXTURE_DESC* dstDesc = dstTextureInfo->Desc();
 
-    VkSampleCountFlagBits dstSampleCount;
-    DecodeMultiSampleType(dstDesc->MultiSample, dstDesc->MultisampleQuality, &dstSampleCount);
+    Rc<DxvkImage> dstImage = dstTextureInfo->HasSampleResolve()
+      ? dstTextureInfo->GetResolveImage() : dstTextureInfo->GetImage();
+    VkSampleCountFlagBits dstSampleCount = dstImage->info().sampleCount;
 
     if (unlikely(dstSampleCount != VK_SAMPLE_COUNT_1_BIT)) {
       Logger::warn("D3D9DeviceEx::ResolveZ: dstSampleCount != 1. Discarding.");
@@ -8568,12 +8745,11 @@ namespace dxvk {
       srcSubresource.mipLevel,
       srcSubresource.arrayLayer, 1 };
 
-    VkSampleCountFlagBits srcSampleCount;
-    DecodeMultiSampleType(srcDesc->MultiSample, srcDesc->MultisampleQuality, &srcSampleCount);
+    VkSampleCountFlagBits srcSampleCount = srcTextureInfo->GetImage()->info().sampleCount;
 
     if (srcSampleCount == VK_SAMPLE_COUNT_1_BIT) {
       EmitCs([
-        cDstImage  = dstTextureInfo->GetImage(),
+        cDstImage  = dstImage,
         cSrcImage  = srcTextureInfo->GetImage(),
         cDstLayers = dstSubresourceLayers,
         cSrcLayers = srcSubresourceLayers
@@ -8585,7 +8761,7 @@ namespace dxvk {
       });
     } else {
       EmitCs([
-        cDstImage  = dstTextureInfo->GetImage(),
+        cDstImage  = dstImage,
         cSrcImage  = srcTextureInfo->GetImage(),
         cDstSubres = dstSubresourceLayers,
         cSrcSubres = srcSubresourceLayers
@@ -8605,6 +8781,18 @@ namespace dxvk {
       });
     }
 
+    if (dstTextureInfo->HasSampleResolve()) {
+      // RESZ promises the first source sample. Replicate that resolved value
+      // into the render image so subsequent rendering and sampling agree.
+      EmitCs([
+        cDst = dstTextureInfo->GetImage(),
+        cSrc = dstImage,
+        cLayers = dstSubresourceLayers
+      ] (DxvkContext* ctx) {
+        ctx->copyImage(cDst, cLayers, { 0, 0, 0 }, cSrc, cLayers, { 0, 0, 0 },
+          cDst->mipLevelExtent(cLayers.mipLevel));
+      });
+    }
     dstTextureInfo->MarkAllNeedReadback();
   }
 

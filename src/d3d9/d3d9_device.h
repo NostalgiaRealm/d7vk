@@ -878,6 +878,9 @@ namespace dxvk {
             VkExtent3D              SrcExtent,
             VkOffset3D              DestOffset);
 
+    void EmitResolveTextureSamples(
+            D3D9CommonTexture* pResource);
+
     void EmitGenerateMips(
             D3D9CommonTexture* pResource);
 
@@ -1061,6 +1064,31 @@ namespace dxvk {
 
     const D3D9Options* GetOptions() const {
       return &m_d3d9Options;
+    }
+
+    // Keep API sizes logical while allocating and rasterizing at the forced resolution.
+    void SetRenderResolution(UINT width, UINT height) {
+      m_logicalRenderExtent = { std::max(width, 1u), std::max(height, 1u) };
+      m_loggedRenderViewport = false;
+    }
+
+    VkExtent3D GetRenderExtent(VkExtent3D logical) const {
+      const auto& graphics = m_d3d9Options.graphics;
+      uint32_t limit = std::min<uint32_t>(caps::MaxTextureDimension,
+        m_dxvkDevice->properties().core.properties.limits.maxImageDimension2D);
+      // DirectDraw owns display modes and may create a desktop-sized primary
+      // while 3D rendering uses a smaller attached surface. Its swap chain size
+      // is therefore not a reliable base for custom render-resolution scaling.
+      if (graphics.width && m_d3dCompatibility.test(D3DCompatibility::D3D7))
+        return { std::min(graphics.width, limit), std::min(graphics.height, limit), logical.depth };
+      uint64_t width = graphics.width
+        ? uint64_t(logical.width) * graphics.width / m_logicalRenderExtent.width
+        : uint64_t(logical.width) * graphics.resolutionScale;
+      uint64_t height = graphics.height
+        ? uint64_t(logical.height) * graphics.height / m_logicalRenderExtent.height
+        : uint64_t(logical.height) * graphics.resolutionScale;
+      return { uint32_t(std::clamp<uint64_t>(width, 1, limit)),
+               uint32_t(std::clamp<uint64_t>(height, 1, limit)), logical.depth };
     }
 
     Direct3DState9* GetRawState() {
@@ -1614,6 +1642,8 @@ namespace dxvk {
 
     Com<D3D9InterfaceEx>            m_parent;
     D3D9Options                     m_d3d9Options;
+    VkExtent2D                      m_logicalRenderExtent = { 1, 1 };
+    bool                            m_loggedRenderViewport = false;
     D3DDEVTYPE                      m_deviceType;
     HWND                            m_window;
     WORD                            m_behaviorFlags;

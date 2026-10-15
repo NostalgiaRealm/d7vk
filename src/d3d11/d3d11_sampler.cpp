@@ -1,6 +1,7 @@
 #include "d3d11_device.h"
 #include "d3d11_sampler.h"
 #include "d3d11_util.h"
+#include "../util/config/graphics_filter.h"
 
 namespace dxvk {
   
@@ -19,9 +20,6 @@ namespace dxvk {
     VkFilter minFilter = (filterBits & 0x10) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     VkFilter magFilter = (filterBits & 0x04) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
-    info.setFilter(minFilter, magFilter,
-      (filterBits & 0x01) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST);
-
     // Enforce LOD bias specified in the device options
     float lodBias = desc.MipLODBias;
 
@@ -32,8 +30,6 @@ namespace dxvk {
         lodBias = std::max(lodBias, 0.0f);
     }
 
-    info.setLodRange(desc.MinLOD, desc.MaxLOD, lodBias);
-
     // Enforce anisotropy specified in the device options
     uint32_t anisotropy = (filterBits & 0x40) ? desc.MaxAnisotropy : 0u;
     int32_t samplerAnisotropyOption = device->GetOptions()->samplerAnisotropy;
@@ -41,7 +37,22 @@ namespace dxvk {
     if (samplerAnisotropyOption >= 0 && minFilter == VK_FILTER_LINEAR)
       anisotropy = samplerAnisotropyOption;
 
-    info.setAniso(anisotropy);
+    const auto filter = applyGraphicsSamplerFilter(device->GetOptions()->graphics, {
+      minFilter == VK_FILTER_LINEAR, magFilter == VK_FILTER_LINEAR,
+      bool(filterBits & 0x01), true, anisotropy });
+
+    info.setFilter(
+      filter.minLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+      filter.magLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+      filter.mipLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST);
+    info.setAniso(filter.anisotropy);
+    info.setLodRange(filter.mipEnabled ? desc.MinLOD : 0.0f,
+      filter.mipEnabled ? desc.MaxLOD : 0.0f, lodBias);
+
+    if (device->GetOptions()->graphics.filtering != GraphicsFilter::App)
+      Logger::debug(str::format("D7VK: D3D11 sampler min/mag/mip=",
+        filter.minLinear, "/", filter.magLinear, "/", filter.mipLinear,
+        ", anisotropy=", filter.anisotropy));
 
     // Set up the remaining properties, which are
     // stored directly in the sampler description

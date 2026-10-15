@@ -1,0 +1,6 @@
+/.local/
+/build*/
+/dist/
+*.log
+*.dxvk-cache
+/subprojects/.wraplock

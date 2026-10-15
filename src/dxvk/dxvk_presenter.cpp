@@ -988,9 +988,16 @@ namespace dxvk {
       updateDisplayTiming();
 
       updateTimingDomains();
-      recalibrateTimeDomains();
-
-      updateTimingMode();
+      if (!m_timingDisplayInfo || !m_timingDomains || !recalibrateTimeDomains()) {
+        // A partially initialized timing path has no valid domain ID. Do not
+        // continue to submit timing queries or drain its queue: some Wine/WSI
+        // implementations fail the domain query yet advertise the extension.
+        Logger::warn("Presenter: Present timing initialization failed; using ordinary presentation");
+        m_timingMode = {};
+        m_vkd->vkSetSwapchainPresentTimingQueueSizeEXT(m_vkd->device(), m_swapchain, 0u);
+      } else {
+        updateTimingMode();
+      }
     }
 
     return VK_SUCCESS;
@@ -1555,7 +1562,12 @@ namespace dxvk {
     feedback.frameId = frameId;
     feedback.presentTime = dxvk::high_resolution_clock::get_counter();
 
-    if (!m_timingMode.presentStage) {
+    if (!m_timingMode.presentStage || !m_timingDomains) {
+      if (m_timingMode.presentStage) {
+        Logger::warn("Presenter: Present timing domains unavailable; using ordinary presentation");
+        m_timingMode = {};
+        m_vkd->vkSetSwapchainPresentTimingQueueSizeEXT(m_vkd->device(), m_swapchain, 0u);
+      }
       commitTimingFeedback(feedback);
       return false;
     }

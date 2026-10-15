@@ -3,6 +3,7 @@
 #include "ddraw_include.h"
 
 #include "../util/config/config.h"
+#include "../util/config/graphics_options.h"
 #include "../util/util_math.h"
 
 namespace dxvk {
@@ -26,6 +27,7 @@ namespace dxvk {
   };
 
   struct D3DOptions {
+    GraphicsOptions graphics;
 
     D3DOptions() {};
 

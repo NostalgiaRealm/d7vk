@@ -44,21 +44,31 @@ namespace dxvk {
       s_materials.erase(materialsIter);
   }
 
-  d3d9::D3DMULTISAMPLE_TYPE D3DCommonInterface::GetMultiSampleType(d3d9::D3DFORMAT backBufferFormat) const {
-    HRESULT hr = m_d3d9Intf->CheckDeviceMultiSampleType(0, d3d9::D3DDEVTYPE_HAL, backBufferFormat,
-                                                        TRUE, d3d9::D3DMULTISAMPLE_4_SAMPLES, NULL);
-    if (likely(SUCCEEDED(hr))) {
-      Logger::info("D3DCommonInterface::GetMultiSampleType: Using 4x MSAA for FSAA emulation");
-      return d3d9::D3DMULTISAMPLE_4_SAMPLES;
-    }
+  d3d9::D3DMULTISAMPLE_TYPE D3DCommonInterface::GetMultiSampleType(
+      d3d9::D3DFORMAT backBufferFormat, uint32_t requestedSamples) const {
+    for (uint32_t samples = requestedSamples; samples >= 2; samples /= 2) {
+      auto type = d3d9::D3DMULTISAMPLE_TYPE(samples);
+      bool supported = SUCCEEDED(m_d3d9Intf->CheckDeviceMultiSampleType(
+        0, d3d9::D3DDEVTYPE_HAL, backBufferFormat, TRUE, type, nullptr));
 
-    hr = m_d3d9Intf->CheckDeviceMultiSampleType(0, d3d9::D3DDEVTYPE_HAL, backBufferFormat,
-                                                TRUE, d3d9::D3DMULTISAMPLE_2_SAMPLES, NULL);
-    if (SUCCEEDED(hr)) {
-      Logger::info("D3DCommonInterface::GetMultiSampleType: Using 2x MSAA for FSAA emulation");
-      return d3d9::D3DMULTISAMPLE_2_SAMPLES;
-    }
+      // A depth surface may be attached after device creation. Choose a count
+      // usable by all of our advertised depth formats, so those attachments
+      // do not end up with a different sample count from the colour buffer.
+      for (auto format : { d3d9::D3DFMT_D16, d3d9::D3DFMT_D24X8, d3d9::D3DFMT_D24S8 }) {
+        if (SUCCEEDED(m_d3d9Intf->CheckDeviceFormat(0, d3d9::D3DDEVTYPE_HAL,
+            backBufferFormat, D3DUSAGE_DEPTHSTENCIL, d3d9::D3DRTYPE_SURFACE, format)))
+          supported &= SUCCEEDED(m_d3d9Intf->CheckDeviceMultiSampleType(
+            0, d3d9::D3DDEVTYPE_HAL, format, TRUE, type, nullptr));
+      }
 
+      if (supported) {
+        Logger::info(str::format("D7VK: Using ", samples, "x MSAA (requested ", requestedSamples, "x)"));
+        if (samples != requestedSamples)
+          Logger::warn("D7VK: Requested MSAA count is unsupported; using the reported lower count");
+        return type;
+      }
+    }
+    Logger::warn(str::format("D7VK: ", requestedSamples, "x MSAA unsupported; antialiasing disabled"));
     return d3d9::D3DMULTISAMPLE_NONE;
   }
 

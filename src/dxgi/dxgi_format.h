@@ -100,7 +100,8 @@ namespace dxvk {
   public:
     
     DXGIVkFormatTable(
-      const Rc<DxvkDevice>& device);
+      const Rc<DxvkDevice>& device,
+            uint32_t depthBits = 0);
     ~DXGIVkFormatTable();
     
     /**

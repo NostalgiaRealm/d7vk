@@ -29,7 +29,7 @@ namespace dxvk {
 
     static void ReleaseMaterialHandle(D3DMATERIALHANDLE handle);
 
-    d3d9::D3DMULTISAMPLE_TYPE GetMultiSampleType(d3d9::D3DFORMAT backBufferFormat) const;
+    d3d9::D3DMULTISAMPLE_TYPE GetMultiSampleType(d3d9::D3DFORMAT backBufferFormat, uint32_t requestedSamples = 4) const;
 
     static D3DMATERIALHANDLE GetNextMaterialHandle() {
       return ++s_materialHandle;

@@ -160,6 +160,7 @@ namespace dxvk {
 
 
   DxgiOptions::DxgiOptions(const Config& config) {
+    graphics = GraphicsOptions(config);
     // Fetch these as a string representing a hexadecimal number and parse it.
     this->customVendorId = parsePciId(config.getOption<std::string>("dxgi.customVendorId"));
     this->customDeviceId = parsePciId(config.getOption<std::string>("dxgi.customDeviceId"));

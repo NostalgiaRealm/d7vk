@@ -30,6 +30,7 @@ namespace dxvk {
 
 
   D3D9Options::D3D9Options(const Rc<DxvkDevice>& device, const Config& config) {
+    graphics = GraphicsOptions(config);
     const Rc<DxvkAdapter> adapter = device != nullptr ? device->adapter() : nullptr;
 
     // Fetch these as a string representing a hexadecimal number and parse it.

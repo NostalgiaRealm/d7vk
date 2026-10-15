@@ -27,6 +27,27 @@ namespace dxvk {
     if (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP)
       m_exposedMipLevels = 1;
 
+    // Keep the API's level count and usage unchanged, but allocate an internal
+    // mip tail for sampled textures. Staging/shared resources retain their
+    // original layout so external copies and handles remain compatible.
+    if (pDevice->GetOptions()->graphics.generatesMipmaps()
+     && !(m_desc.Usage & (D3DUSAGE_AUTOGENMIPMAP | D3DUSAGE_DEPTHSTENCIL))
+     && ResourceType != D3DRTYPE_SURFACE
+     && m_desc.MultiSample == D3DMULTISAMPLE_NONE
+     && (m_desc.Pool == D3DPOOL_DEFAULT || IsPoolManaged(m_desc.Pool))
+     && !pSharedHandle) {
+      VkExtent3D mipExtent = { m_desc.Width, m_desc.Height, m_desc.Depth };
+      if (m_desc.Usage & D3DUSAGE_RENDERTARGET)
+        mipExtent = m_device->GetRenderExtent(mipExtent);
+      if (ResourceType == D3DRTYPE_CUBETEXTURE && mipExtent.width != mipExtent.height)
+        mipExtent = { m_desc.Width, m_desc.Height, m_desc.Depth };
+      const uint32_t fullChain = std::min(util::computeMipLevelCount(mipExtent), caps::MaxMipLevels);
+      if (m_desc.MipLevels < fullChain) {
+        m_desc.MipLevels = fullChain;
+        m_forcedMipMaps = true;
+      }
+    }
+
     for (uint32_t i = 0; i < m_dirtyBoxes.size(); i++) {
       AddDirtyBox(nullptr, i);
     }
@@ -46,11 +67,17 @@ namespace dxvk {
     if (TextureUsesImage(&m_desc)) {
       m_image = CreatePrimaryImage(ResourceType, pSharedHandle);
 
-      if (unlikely(m_image == nullptr && (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP))) {
+      if (unlikely(m_image == nullptr && IsAutomaticMip())) {
         // AUTOGENMIPMAP is supposed to be treated like a hint according to the docs.
         // So if creating an image with it fails, create one without it.
         m_desc.Usage &= ~D3DUSAGE_AUTOGENMIPMAP;
-        m_desc.MipLevels = 1;
+        m_desc.MipLevels = m_forcedMipMaps ? m_exposedMipLevels : 1;
+        m_forcedMipMaps = false;
+        // Cube face upload indices depend on the internal level count.
+        if (IsPoolManaged(m_desc.Pool)) {
+          ClearNeedsUpload();
+          SetAllNeedUpload();
+        }
         m_image = CreatePrimaryImage(ResourceType, pSharedHandle);
       }
 
@@ -77,8 +104,15 @@ namespace dxvk {
       if ((m_image->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0)
         CreateSampleView(0);
 
+      if (m_forcedMipMaps)
+        Logger::debug(str::format("D7VK: D3D9 generated mip tail: ", m_desc.Width,
+          "x", m_desc.Height, ", app levels=", m_exposedMipLevels,
+          ", internal levels=", m_desc.MipLevels));
+
       if (!IsManaged()) {
         m_size = m_image->getMemoryInfo().size;
+        if (m_resolveImage)
+          m_size += m_resolveImage->getMemoryInfo().size;
         if (!m_device->ChangeReportedMemory(-m_size))
           throw DxvkError("D3D9: Reporting out of memory from tracking.");
       }
@@ -367,12 +401,20 @@ namespace dxvk {
   }
 
 
+  const DxvkFormatInfo* D3D9CommonTexture::GetPackedFormatInfo() const {
+    VkFormat packed = GetPackedDepthStencilFormat(m_desc.Format);
+    if (packed != VK_FORMAT_UNDEFINED)
+      return lookupFormatInfo(packed);
+    return m_mapping.Format != VK_FORMAT_UNDEFINED
+      ? lookupFormatInfo(m_mapping.Format)
+      : m_device->UnsupportedFormatInfo(m_desc.Format);
+  }
+
+
   VkDeviceSize D3D9CommonTexture::GetSubresourceSize(UINT Subresource) const {
     const UINT MipLevel = Subresource % m_desc.MipLevels;
 
-    const DxvkFormatInfo* formatInfo = m_mapping.Format != VK_FORMAT_UNDEFINED
-      ? lookupFormatInfo(m_mapping.Format)
-      : m_device->UnsupportedFormatInfo(m_desc.Format);
+    const DxvkFormatInfo* formatInfo = GetPackedFormatInfo();
 
     const VkExtent3D mipExtent = util::computeMipLevelExtent(
       GetExtent(), MipLevel);
@@ -408,6 +450,15 @@ namespace dxvk {
     imageInfo.extent.width    = m_desc.Width;
     imageInfo.extent.height   = m_desc.Height;
     imageInfo.extent.depth    = m_desc.Depth;
+    if (!pSharedHandle && (m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))
+      imageInfo.extent = m_device->GetRenderExtent(imageInfo.extent);
+    // Cube faces must remain square and every app-visible mip must exist.
+    if ((ResourceType == D3DRTYPE_CUBETEXTURE && imageInfo.extent.width != imageInfo.extent.height)
+     || util::computeMipLevelCount(imageInfo.extent) < m_desc.MipLevels)
+      imageInfo.extent = GetExtent();
+    if (m_desc.IsBackBuffer && m_device->GetOptions()->graphics.scalesResolution())
+      Logger::info(str::format("D7VK: Render resolution ", m_desc.Width, "x", m_desc.Height,
+        " logical -> ", imageInfo.extent.width, "x", imageInfo.extent.height, " physical"));
     imageInfo.numLayers       = m_desc.ArraySize;
     imageInfo.mipLevels       = m_desc.MipLevels;
     imageInfo.usage           = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -441,6 +492,34 @@ namespace dxvk {
 
     DecodeMultiSampleType(m_desc.MultiSample, m_desc.MultisampleQuality, &imageInfo.sampleCount);
 
+    // Keep the public descriptor intact. Sampled 2D attachments with one app mip
+    // use a private single-sample resolve image for their ordinary sampler
+    // views, since D3D8/9 shaders cannot declare multisampled textures.
+    int32_t forcedSamples = m_device->GetOptions()->graphics.msaa;
+    bool overrideSamples = forcedSamples >= 0 && !pSharedHandle
+      && (ResourceType == D3DRTYPE_SURFACE
+       || (ResourceType == D3DRTYPE_TEXTURE && m_exposedMipLevels == 1))
+      && (m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL));
+    if (forcedSamples > 0 && !overrideSamples
+     && (m_desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))
+      Logger::warn(str::format("D7VK: MSAA override retains application sample layout for shared, cube, "
+        "or multiple-mip attachment (type=", ResourceType, ", app levels=", m_exposedMipLevels,
+        ", actual samples=", uint32_t(imageInfo.sampleCount), ")"));
+    if (overrideSamples) {
+      uint32_t samples = forcedSamples ? uint32_t(forcedSamples) : 1u;
+      const auto& limits = m_device->GetDXVKDevice()->properties().core.properties.limits;
+      VkSampleCountFlags supported = limits.framebufferColorSampleCounts
+                                  & limits.framebufferDepthSampleCounts
+                                  & limits.framebufferStencilSampleCounts;
+      while (samples > 1 && !(supported & samples))
+        samples /= 2;
+      imageInfo.sampleCount = VkSampleCountFlagBits(samples);
+      // A multisampled image has only level zero. Hidden/generated levels
+      // belong to the single-sample image used by shader sampler views.
+      if (imageInfo.sampleCount > VK_SAMPLE_COUNT_1_BIT)
+        imageInfo.mipLevels = 1;
+    }
+
     // The image must be marked as mutable if it can be reinterpreted
     // by a view with a different format. Depth-stencil formats cannot
     // be reinterpreted in Vulkan, so we'll ignore those.
@@ -458,7 +537,7 @@ namespace dxvk {
 
     const bool isRT = m_desc.Usage & D3DUSAGE_RENDERTARGET;
     const bool isDS = m_desc.Usage & D3DUSAGE_DEPTHSTENCIL;
-    const bool isAutoGen = m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP;
+    const bool isAutoGen = IsAutomaticMip();
 
     if (!m_desc.IsAttachmentOnly || (!isRT && !isDS))
       imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -481,6 +560,22 @@ namespace dxvk {
 
     if (ResourceType == D3DRTYPE_CUBETEXTURE)
       imageInfo.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+
+    if (overrideSamples) {
+      // Check the complete image usage, including readback and format flags,
+      // rather than relying only on generic physical-device sample limits.
+      while (imageInfo.sampleCount > VK_SAMPLE_COUNT_1_BIT
+          && !CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
+        imageInfo.sampleCount = VkSampleCountFlagBits(uint32_t(imageInfo.sampleCount) / 2);
+      if (imageInfo.sampleCount == VK_SAMPLE_COUNT_1_BIT)
+        imageInfo.mipLevels = m_desc.MipLevels;
+      uint32_t requested = forcedSamples ? uint32_t(forcedSamples) : 1u;
+      if (uint32_t(imageInfo.sampleCount) != requested)
+        Logger::warn(str::format("D7VK: Requested ", requested, "x MSAA unsupported for ",
+          imageInfo.format, "; using ", uint32_t(imageInfo.sampleCount), "x"));
+      Logger::info(str::format("D7VK: Attachment ", imageInfo.extent.width, "x", imageInfo.extent.height,
+        " format ", imageInfo.format, ", actual samples ", uint32_t(imageInfo.sampleCount)));
+    }
 
     // Some image formats (i.e. the R32G32B32 ones) are
     // only supported with linear tiling on most GPUs
@@ -520,8 +615,24 @@ namespace dxvk {
   Rc<DxvkImage> D3D9CommonTexture::CreateResolveImage() const {
     DxvkImageCreateInfo imageInfo = m_image->info();
     imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    if (HasSampleResolve())
+      imageInfo.mipLevels = m_desc.MipLevels;
 
     return m_device->GetDXVKDevice()->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  }
+
+
+  const Rc<DxvkImage>& D3D9CommonTexture::GetMappingImage() {
+    if (!m_mappingImage) {
+      auto info = m_image->info();
+      info.extent = GetExtent();
+      info.mipLevels = std::min(info.mipLevels, util::computeMipLevelCount(info.extent));
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.shared = false;
+      info.sharing = {};
+      m_mappingImage = m_device->GetDXVKDevice()->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+    return m_mappingImage;
   }
 
 
@@ -768,8 +879,11 @@ namespace dxvk {
     if (UsageFlags & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
       viewInfo.packedSwizzle = 0u;
 
-    // Create the underlying image view object
-    return GetImage()->createView(viewInfo);
+    // Shaders keep seeing an ordinary single-sample texture. Rendering,
+    // clears, copies and locks continue to access the multisampled image.
+    auto image = (UsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) && HasSampleResolve()
+      ? GetResolveImage() : GetImage();
+    return image->createView(viewInfo);
   }
 
 

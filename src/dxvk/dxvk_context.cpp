@@ -228,6 +228,35 @@ namespace dxvk {
     const Rc<DxvkImageView>&    srcView,
     const VkOffset3D*           srcOffsets,
           VkFilter              filter) {
+    constexpr VkImageAspectFlags depthStencilAspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    if ((dstView->info().aspects & depthStencilAspects) == depthStencilAspects) {
+      // Each aspect has its own sample type and framebuffer write operation.
+      for (VkImageAspectFlags aspects = depthStencilAspects; aspects; ) {
+        VkImageAspectFlags aspect = aspects & -aspects;
+        aspects &= ~aspect;
+        auto dstKey = dstView->info();
+        auto srcKey = srcView->info();
+        dstKey.aspects = srcKey.aspects = aspect;
+        blitImageView(dstView->image()->createView(dstKey), dstOffsets,
+          srcView->image()->createView(srcKey), srcOffsets, filter);
+      }
+      return;
+    }
+    if (dstView->info().aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      filter = VK_FILTER_NEAREST;
+      // Stencil has no averaging operation. Resolve sample zero before the
+      // ordinary integer sampling blit, including on devices without export.
+      if (srcView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+        auto layers = vk::pickSubresourceLayers(srcView->imageSubresources(), 0u);
+        auto resolved = resolveImageForCopy(srcView->image(), layers,
+          { 0, 0, 0 }, srcView->mipLevelExtent(0));
+        auto key = srcView->info();
+        key.mipIndex = key.layerIndex = 0u;
+        key.mipCount = 1u;
+        blitImageView(dstView, dstOffsets, resolved->createView(key), srcOffsets, filter);
+        return;
+      }
+    }
     this->endCurrentPass(true);
 
     auto mapping = util::resolveSrcComponentMapping(
@@ -261,6 +290,94 @@ namespace dxvk {
       this->blitImageHw(dstView, dstOffsets,
         srcView, srcOffsets, filter);
     }
+
+    if (dstView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      m_implicitResolves.invalidate(*dstView->image(), dstView->imageSubresources());
+  }
+
+
+  void DxvkContext::blitResolutionImage(
+    const Rc<DxvkImage>& dstImage, const Rc<DxvkImage>& srcImage,
+    VkImageSubresourceLayers dstLayers, VkOffset3D dstOffset, VkExtent3D dstExtent,
+    VkImageSubresourceLayers srcLayers, VkOffset3D srcOffset, VkExtent3D srcExtent) {
+    Rc<DxvkImage> source = srcImage;
+    Rc<DxvkImage> destination = dstImage;
+    bool depthStencil = dstLayers.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+
+    // A scaled API copy still preserves the source bit representation.
+    // Blitting UNORM directly into UINT would numerically convert the pixels;
+    // depth/stencil blits also require identical physical formats. Perform the
+    // format copy first, then resize matching formats.
+    if (source->info().format != destination->info().format) {
+      auto info = destination->info();
+      auto blocks = util::computeBlockCount(srcExtent, source->formatInfo()->blockSize);
+      auto dstBlock = destination->formatInfo()->blockSize;
+      info.extent = { blocks.width * dstBlock.width, blocks.height * dstBlock.height,
+                      blocks.depth * dstBlock.depth };
+      info.numLayers = srcLayers.layerCount;
+      info.mipLevels = 1;
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      info.shared = false;
+      info.sharing = {};
+      auto converted = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      VkImageSubresourceLayers convertedLayers = { dstLayers.aspectMask, 0u, 0u, srcLayers.layerCount };
+      copyImage(converted, convertedLayers, { 0, 0, 0 }, source, srcLayers, srcOffset, srcExtent);
+      source = std::move(converted);
+      srcLayers = convertedLayers;
+      srcOffset = { 0, 0, 0 };
+      srcExtent = info.extent;
+    }
+
+    auto singleSample = [this] (const Rc<DxvkImage>& image) {
+      auto info = image->info();
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.shared = false;
+      info.sharing = {};
+      return m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    };
+
+    // Resolve and scale depth and stencil separately as single-sample data,
+    // then replicate through the copy path to all destination samples. This
+    // preserves stencil and avoids averaging it during scaled MSAA transfers.
+    if (depthStencil && source->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      auto resolved = singleSample(source);
+      copyImage(resolved, srcLayers, srcOffset, source, srcLayers, srcOffset, srcExtent);
+      source = std::move(resolved);
+    }
+    if (depthStencil && dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      destination = singleSample(dstImage);
+
+    VkOffset3D dstOffsets[] = { dstOffset, {
+      dstOffset.x + int32_t(dstExtent.width), dstOffset.y + int32_t(dstExtent.height), dstOffset.z + int32_t(dstExtent.depth) } };
+    VkOffset3D srcOffsets[] = { srcOffset, {
+      srcOffset.x + int32_t(srcExtent.width), srcOffset.y + int32_t(srcExtent.height), srcOffset.z + int32_t(srcExtent.depth) } };
+
+    for (VkImageAspectFlags aspects = dstLayers.aspectMask; aspects; ) {
+      VkImageAspectFlags aspect = aspects & -aspects;
+      aspects &= ~aspect;
+      DxvkImageViewKey key = {};
+      key.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      key.aspects = aspect;
+      key.mipIndex = dstLayers.mipLevel;
+      key.mipCount = 1;
+      key.layerIndex = dstLayers.baseArrayLayer;
+      key.layerCount = dstLayers.layerCount;
+      key.format = destination->info().format;
+      key.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      auto dstView = destination->createView(key);
+      key.aspects = depthStencil ? aspect : srcLayers.aspectMask;
+      key.mipIndex = srcLayers.mipLevel;
+      key.layerIndex = srcLayers.baseArrayLayer;
+      key.layerCount = srcLayers.layerCount;
+      key.format = source->info().format;
+      key.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      auto srcView = source->createView(key);
+      blitImageView(dstView, dstOffsets, srcView, srcOffsets, VK_FILTER_NEAREST);
+    }
+
+    if (destination != dstImage)
+      copyImage(dstImage, dstLayers, dstOffset, destination, dstLayers, dstOffset, dstExtent);
   }
 
 
@@ -543,6 +660,9 @@ namespace dxvk {
       copyBufferToImageHw(dstImage, dstSubresource, dstOffset, dstExtent,
         srcBuffer, srcOffset, rowAlignment, sliceAlignment);
     }
+
+    if (dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      m_implicitResolves.invalidate(*dstImage, vk::makeSubresourceRange(dstSubresource));
   }
   
   
@@ -554,11 +674,21 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
-    if (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource)
-     || this->copyImageInline(*dstImage, dstSubresource, dstOffset, *srcImage, srcSubresource, srcOffset, extent))
+    // Overrides can make API-compatible resources use different physical
+    // sample counts. Resolve before copying out of an internal MSAA image.
+    const bool sampleMismatch = dstImage->info().sampleCount != srcImage->info().sampleCount;
+    if (sampleMismatch && srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      auto resolved = resolveImageForCopy(srcImage, srcSubresource, srcOffset, extent);
+      VkImageSubresourceLayers subresource = { srcSubresource.aspectMask, 0u, 0u, srcSubresource.layerCount };
+      copyImage(dstImage, dstSubresource, dstOffset, resolved, subresource, { 0, 0, 0 }, extent);
+      return;
+    }
+
+    if (!sampleMismatch && (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource)
+     || this->copyImageInline(*dstImage, dstSubresource, dstOffset, *srcImage, srcSubresource, srcOffset, extent)))
       return;
 
-    bool useFb = !formatsAreImageCopyCompatible(dstImage->info().format, srcImage->info().format);
+    bool useFb = sampleMismatch || !formatsAreImageCopyCompatible(dstImage->info().format, srcImage->info().format);
 
     if (m_device->perfHints().preferFbDepthStencilCopy) {
       useFb |= (dstSubresource.aspectMask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
@@ -661,6 +791,14 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            srcExtent) {
+    if (srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      auto resolved = resolveImageForCopy(srcImage, srcSubresource, srcOffset, srcExtent);
+      VkImageSubresourceLayers subresource = { srcSubresource.aspectMask, 0u, 0u, srcSubresource.layerCount };
+      copyImageToBuffer(dstBuffer, dstOffset, rowAlignment, sliceAlignment,
+        dstFormat, resolved, subresource, { 0, 0, 0 }, srcExtent);
+      return;
+    }
+
     bool useFb = !formatsAreBufferCopyCompatible(srcImage->info().format, dstFormat);
 
     if (useFb) {
@@ -671,6 +809,45 @@ namespace dxvk {
       copyImageToBufferHw(dstBuffer, dstOffset, rowAlignment, sliceAlignment,
         srcImage, srcSubresource, srcOffset, srcExtent);
     }
+  }
+
+
+  Rc<DxvkImage> DxvkContext::resolveImageForCopy(
+    const Rc<DxvkImage>& image,
+          VkImageSubresourceLayers subresource,
+          VkOffset3D offset,
+          VkExtent3D extent) {
+    const bool depth = image->formatInfo()->aspectMask
+      & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    DxvkImageCreateInfo info;
+    info.format = image->info().format;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent = extent;
+    info.numLayers = subresource.layerCount;
+    info.mipLevels = 1u;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+      | VK_IMAGE_USAGE_SAMPLED_BIT | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+      | (depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+               : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    info.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+      | (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    info.layout = VK_IMAGE_LAYOUT_GENERAL;
+    info.debugName = "D7VK MSAA transfer resolve";
+    auto resolved = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkImageResolve region;
+    region.srcSubresource = subresource;
+    region.srcOffset = offset;
+    region.dstSubresource = { subresource.aspectMask, 0u, 0u, subresource.layerCount };
+    region.dstOffset = { 0, 0, 0 };
+    region.extent = extent;
+    VkResolveModeFlagBits depthMode = !depth ? getDefaultResolveMode(image->formatInfo())
+      : (subresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)
+        ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
+    VkResolveModeFlagBits stencilMode = subresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT
+      ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
+    resolveImage(resolved, image, region, info.format, depthMode, stencilMode);
+    return resolved;
   }
 
 
@@ -1874,10 +2051,62 @@ namespace dxvk {
 
     if (!(aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
       stencilMode = VK_RESOLVE_MODE_NONE;
+    if (!(aspects & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT)))
+      mode = VK_RESOLVE_MODE_NONE;
 
     // No-op, but legal
     if (!mode && !stencilMode)
       return;
+
+    // A logical single-sample target may be backed by forced MSAA. Resolve
+    // into a single-sample region first, then broadcast it to the target's
+    // samples. Only copy aspects that were actually resolved.
+    VkImageAspectFlags resolvedAspects = aspects;
+    if (!mode)
+      resolvedAspects &= ~(VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!stencilMode)
+      resolvedAspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+
+    if (srcImage->info().sampleCount == VK_SAMPLE_COUNT_1_BIT) {
+      auto dstLayers = region.dstSubresource;
+      auto srcLayers = region.srcSubresource;
+      dstLayers.aspectMask = srcLayers.aspectMask = resolvedAspects;
+      copyImage(dstImage, dstLayers, region.dstOffset,
+        srcImage, srcLayers, region.srcOffset, region.extent);
+      return;
+    }
+
+    if (dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      const bool depth = formatInfo->aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+      DxvkImageCreateInfo info;
+      info.format = format;
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.extent = region.extent;
+      info.numLayers = region.dstSubresource.layerCount;
+      info.mipLevels = 1u;
+      info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+        | (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+        | (depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                 : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+      info.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+        | (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                 : VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+      info.layout = VK_IMAGE_LAYOUT_GENERAL;
+      info.debugName = "D7VK MSAA resolve destination";
+      auto temporary = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      VkImageResolve tempRegion = region;
+      tempRegion.dstSubresource.mipLevel = 0u;
+      tempRegion.dstSubresource.baseArrayLayer = 0u;
+      tempRegion.dstOffset = { 0, 0, 0 };
+      resolveImage(temporary, srcImage, tempRegion, format, mode, stencilMode);
+      auto dstLayers = region.dstSubresource;
+      auto srcLayers = tempRegion.dstSubresource;
+      dstLayers.aspectMask = srcLayers.aspectMask = resolvedAspects;
+      copyImage(dstImage, dstLayers, region.dstOffset,
+        temporary, srcLayers, { 0, 0, 0 }, region.extent);
+      return;
+    }
 
     // Check whether the given resolve modes are supported for render pass resolves
     bool useFb = false;
@@ -3350,6 +3579,7 @@ namespace dxvk {
           VkFilter              filter) {
     this->invalidateState();
 
+    const VkImageAspectFlags blitAspect = dstView->info().aspects;
     bool dstIsDepthStencil = dstView->info().aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
     dstView = ensureImageViewCompatibility(dstView, dstIsDepthStencil
@@ -3360,6 +3590,12 @@ namespace dxvk {
     if (!dstView || !srcView) {
       Logger::err(str::format("DxvkContext: blitImageFb: Resources not supported"));
       return;
+    }
+
+    if (dstIsDepthStencil) {
+      auto key = dstView->info();
+      key.aspects = dstView->image()->formatInfo()->aspectMask;
+      dstView = dstView->image()->createView(key);
     }
 
     if (unlikely(m_features.test(DxvkContextFeature::DebugUtils))) {
@@ -3373,8 +3609,11 @@ namespace dxvk {
     }
 
     small_vector<DxvkResourceAccess, 2u> accessBatch;
-    accessBatch.emplace_back(*dstView, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, false);
+    accessBatch.emplace_back(*dstView, dstIsDepthStencil
+      ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT
+      : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, dstIsDepthStencil
+      ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+      : VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, false);
     accessBatch.emplace_back(*srcView, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
       VK_ACCESS_2_SHADER_READ_BIT, false);
     syncResources(DxvkCmdBuffer::ExecBuffer, accessBatch.size(), accessBatch.data());
@@ -3409,6 +3648,7 @@ namespace dxvk {
     DxvkMetaBlit::Key metaKey = { };
     metaKey.srcViewType = srcView->info().viewType;
     metaKey.dstFormat = dstView->info().format;
+    metaKey.dstAspect = dstIsDepthStencil ? blitAspect : VK_IMAGE_ASPECT_COLOR_BIT;
     metaKey.dstSamples = dstView->image()->info().sampleCount;
     metaKey.srcSamples = srcView->image()->info().sampleCount;
     metaKey.resolveMode = filter == VK_FILTER_NEAREST
@@ -3445,11 +3685,30 @@ namespace dxvk {
     attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
+    auto stencilInfo = attachmentInfo;
+    const bool bitwiseStencil = (blitAspect & VK_IMAGE_ASPECT_STENCIL_BIT)
+      && !m_device->features().extShaderStencilExport;
+    if (dstIsDepthStencil) {
+      if (!(blitAspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      if (!(blitAspect & VK_IMAGE_ASPECT_STENCIL_BIT))
+        stencilInfo.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      else if (bitwiseStencil)
+        stencilInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    }
+
     VkRenderingInfo renderingInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     renderingInfo.renderArea = scissor;
     renderingInfo.layerCount = dstView->info().layerCount;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &attachmentInfo;
+    if (dstIsDepthStencil) {
+      if (dstView->info().aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+        renderingInfo.pDepthAttachment = &attachmentInfo;
+      if (dstView->info().aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+        renderingInfo.pStencilAttachment = &stencilInfo;
+    } else {
+      renderingInfo.colorAttachmentCount = 1;
+      renderingInfo.pColorAttachments = &attachmentInfo;
+    }
 
     m_cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderingInfo);
     m_cmd->cmdSetViewport(1, &viewport);
@@ -3480,10 +3739,18 @@ namespace dxvk {
       ? dstView->info().layerCount : 1u;
 
     while (pushArgs.layerIndex < pushArgs.layerCount) {
-      m_cmd->bindResources(DxvkCmdBuffer::ExecBuffer,
-        meta.layout, 0, nullptr, sizeof(pushArgs), &pushArgs);
-
-      m_cmd->cmdDraw(3u, instances, 0u, 0u);
+      if (bitwiseStencil) {
+        for (pushArgs.stencilBit = 1u; pushArgs.stencilBit < 0x100u; pushArgs.stencilBit <<= 1u) {
+          m_cmd->bindResources(DxvkCmdBuffer::ExecBuffer,
+            meta.layout, 0, nullptr, sizeof(pushArgs), &pushArgs);
+          m_cmd->cmdSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK, pushArgs.stencilBit);
+          m_cmd->cmdDraw(3u, instances, 0u, 0u);
+        }
+      } else {
+        m_cmd->bindResources(DxvkCmdBuffer::ExecBuffer,
+          meta.layout, 0, nullptr, sizeof(pushArgs), &pushArgs);
+        m_cmd->cmdDraw(3u, instances, 0u, 0u);
+      }
       pushArgs.layerIndex += instances;
     }
 
@@ -4686,6 +4953,7 @@ namespace dxvk {
     metaKey.dstFormat = viewFormats.dstFormat;
     metaKey.dstAspects = dstSubresource.aspectMask;
     metaKey.samples = dstImage->info().sampleCount;
+    metaKey.srcSamples = srcImage->info().sampleCount;
 
     if (useBitwiseStencil)
         metaKey.dstAspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;

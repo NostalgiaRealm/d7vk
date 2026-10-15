@@ -444,6 +444,35 @@ namespace dxvk {
     VkRect2D srcRect = ComputeSrcPresentRect();
     VkRect2D dstRect = ComputeDstPresentRect(dstSize, srcRect.extent);
 
+    DXGI_PRESENT_PARAMETERS scaledParameters = {};
+    std::vector<RECT> scaledDirtyRects;
+    RECT scaledScrollRect = {};
+    POINT scaledScrollOffset = {};
+    auto texture = GetCommonTexture(m_backBuffers[0].ptr());
+    if (pPresentParameters && texture->IsScaled()) {
+      scaledParameters = *pPresentParameters;
+      auto scaleRect = [texture] (RECT rect) {
+        VkOffset3D offset = { rect.left, rect.top, 0 };
+        VkExtent3D extent = { uint32_t(std::max(0L, rect.right - rect.left)),
+                              uint32_t(std::max(0L, rect.bottom - rect.top)), 1 };
+        texture->ScaleRegion(offset, extent);
+        return RECT { offset.x, offset.y, offset.x + LONG(extent.width), offset.y + LONG(extent.height) };
+      };
+      for (uint32_t i = 0; i < scaledParameters.DirtyRectsCount; i++)
+        scaledDirtyRects.push_back(scaleRect(pPresentParameters->pDirtyRects[i]));
+      scaledParameters.pDirtyRects = scaledDirtyRects.data();
+      if (pPresentParameters->pScrollRect) {
+        scaledScrollRect = scaleRect(*pPresentParameters->pScrollRect);
+        scaledParameters.pScrollRect = &scaledScrollRect;
+      }
+      if (pPresentParameters->pScrollOffset) {
+        scaledScrollOffset.x = int64_t(pPresentParameters->pScrollOffset->x) * srcRect.extent.width / m_desc.Width;
+        scaledScrollOffset.y = int64_t(pPresentParameters->pScrollOffset->y) * srcRect.extent.height / m_desc.Height;
+        scaledParameters.pScrollOffset = &scaledScrollOffset;
+      }
+      pPresentParameters = &scaledParameters;
+    }
+
     // Incremental presentation is only supported with flip model presentation
     // on native, not 100% sure about the exact validation here.
     bool incrementalPresent = UseIncrementalPresent(pPresentParameters);
@@ -607,6 +636,7 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateBackBuffers() {
+    m_parent->SetRenderResolution(m_desc.Width, m_desc.Height);
     // Explicitly destroy current swap image before
     // creating a new one to free up resources
     m_backBuffers.clear();
@@ -773,8 +803,9 @@ namespace dxvk {
 
   VkRect2D D3D11SwapChain::ComputeSrcPresentRect() const {
     VkRect2D rect = {};
-    rect.extent.width = m_desc.Width;
-    rect.extent.height = m_desc.Height;
+    auto extent = GetCommonTexture(m_backBuffers[0].ptr())->GetImage()->info().extent;
+    rect.extent.width = extent.width;
+    rect.extent.height = extent.height;
     return rect;
   }
 
@@ -1101,8 +1132,9 @@ namespace dxvk {
       bool hasFullRect = false;
 
       RECT fullRect = {};
-      fullRect.right = m_desc.Width;
-      fullRect.bottom = m_desc.Height;
+      auto extent = GetCommonTexture(m_backBuffers[0].ptr())->GetImage()->info().extent;
+      fullRect.right = extent.width;
+      fullRect.bottom = extent.height;
 
       for (uint32_t i = 0u; i < pPresentParameters->DirtyRectsCount; i++) {
         const auto& rect = pPresentParameters->pDirtyRects[i];

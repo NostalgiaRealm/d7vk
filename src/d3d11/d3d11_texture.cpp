@@ -7,6 +7,25 @@
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
+
+  void UpdateD3D11SampledImage(DxvkContext* ctx,
+    const Rc<DxvkImage>& renderImage, const Rc<DxvkImage>& sampledImage,
+    const Rc<DxvkImageView>& mipView, VkFilter mipFilter) {
+    if (renderImage != sampledImage) {
+      auto aspects = renderImage->formatInfo()->aspectMask;
+      VkImageResolve region = { };
+      region.srcSubresource = { aspects, 0u, 0u, renderImage->info().numLayers };
+      region.dstSubresource = region.srcSubresource;
+      region.extent = renderImage->info().extent;
+      auto mode = aspects & VK_IMAGE_ASPECT_COLOR_BIT
+        ? getDefaultResolveMode(renderImage->formatInfo())
+        : aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
+      ctx->resolveImage(sampledImage, renderImage, region, renderImage->info().format,
+        mode, aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE);
+    }
+    if (mipView)
+      ctx->generateMipmaps(mipView, mipFilter);
+  }
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -45,6 +64,25 @@ namespace dxvk {
     imageInfo.initialLayout   = VK_IMAGE_LAYOUT_UNDEFINED;
     imageInfo.shared          = vkImage != VK_NULL_HANDLE;
 
+    // Keep shared/interop, compute and CPU-mapped texture layouts exact.
+    // Raster attachments retain their logical descriptions and normalized UVs.
+    if (Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D && !imageInfo.shared
+     && !p11on12Info && !m_desc.CPUAccessFlags
+     && !(m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+                           | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_GDI_COMPATIBLE
+                           | D3D11_RESOURCE_MISC_TILED))
+     && !(m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+     && (m_desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)))
+      imageInfo.extent = pDevice->GetRenderExtent(imageInfo.extent);
+
+    if (((m_desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) && imageInfo.extent.width != imageInfo.extent.height)
+     || util::computeMipLevelCount(imageInfo.extent) < m_desc.MipLevels)
+      imageInfo.extent = MipLevelExtent(0);
+
+    if ((DxgiUsage & DXGI_USAGE_BACK_BUFFER) && pDevice->GetOptions()->graphics.scalesResolution())
+      Logger::info(str::format("D7VK: Render resolution ", m_desc.Width, "x", m_desc.Height,
+        " logical -> ", imageInfo.extent.width, "x", imageInfo.extent.height, " physical"));
+
     // Normalise hSharedhandle to INVALID_HANDLE_VALUE to allow passing in nullptr
     if (hSharedHandle == nullptr)
       hSharedHandle = INVALID_HANDLE_VALUE;
@@ -69,6 +107,39 @@ namespace dxvk {
 
     if (!pDevice->GetOptions()->disableMsaa)
       DecodeSampleCount(m_desc.SampleDesc.Count, &imageInfo.sampleCount);
+
+    // Keep Texture2D versus Texture2DMS shader declarations valid by giving
+    // shader-visible logical single-sample attachments a resolved SRV image.
+    int32_t forcedSamples = pDevice->GetOptions()->graphics.msaa;
+    bool promotableAttachment = (m_desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL))
+      && !(m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
+      && !m_desc.CPUAccessFlags && m_desc.Usage == D3D11_USAGE_DEFAULT
+      && m_desc.MipLevels == 1 && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
+      && !(m_desc.MiscFlags & (D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TEXTURECUBE
+                            | D3D11_RESOURCE_MISC_GDI_COMPATIBLE));
+    bool overrideSamples = forcedSamples > 0 && (m_desc.SampleDesc.Count > 1 || promotableAttachment)
+      && !imageInfo.shared && !p11on12Info;
+    if (forcedSamples > 0 && !overrideSamples
+     && (m_desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)))
+      Logger::warn(str::format("D7VK: D3D10/11 MSAA override retains application sample layout for this "
+        "shared, interop, UAV, mapped, cube or multiple-mip attachment; actual samples ",
+        uint32_t(imageInfo.sampleCount)));
+    if (overrideSamples) {
+      uint32_t samples = uint32_t(forcedSamples);
+      const auto& limits = pDevice->GetDXVKDevice()->properties().core.properties.limits;
+      VkSampleCountFlags supported = limits.framebufferColorSampleCounts
+                                  & limits.framebufferDepthSampleCounts
+                                  & limits.framebufferStencilSampleCounts;
+      while (samples > 1 && !(supported & samples))
+        samples /= 2;
+      // Existing Texture2DMS shaders may use literal sample indices. Keep
+      // those valid when an override requests fewer samples than the app.
+      if (m_desc.SampleDesc.Count > 1 && (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+        samples = std::max(samples, m_desc.SampleDesc.Count);
+      // Falling back to single-sampling would also change the shader type.
+      if (samples > 1 || m_desc.SampleDesc.Count == 1)
+        imageInfo.sampleCount = VkSampleCountFlagBits(samples);
+    }
 
     if ((m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) && IsR32UavCompatibleFormat(m_desc.Format)) {
       formatFamily.Add(formatInfo.Format);
@@ -96,6 +167,13 @@ namespace dxvk {
     if (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
       imageInfo.usage  |= VK_IMAGE_USAGE_SAMPLED_BIT;
       imageInfo.stages |= pDevice->GetEnabledShaderStages();
+      imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
+    }
+
+    // Resolves and readbacks may need to sample a promoted depth attachment.
+    if (overrideSamples) {
+      imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      imageInfo.stages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
       imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
     }
     
@@ -161,6 +239,60 @@ namespace dxvk {
       imageInfo.stages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
       imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
       imageInfo.shared = VK_TRUE;
+    }
+
+    if (overrideSamples) {
+      VkSampleCountFlagBits minimum = m_desc.SampleDesc.Count > 1
+        ? (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+          ? VkSampleCountFlagBits(m_desc.SampleDesc.Count) : VK_SAMPLE_COUNT_2_BIT
+        : VK_SAMPLE_COUNT_1_BIT;
+      while (imageInfo.sampleCount > minimum
+          && !CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
+        imageInfo.sampleCount = VkSampleCountFlagBits(uint32_t(imageInfo.sampleCount) / 2);
+      if (!CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
+        DecodeSampleCount(m_desc.SampleDesc.Count, &imageInfo.sampleCount);
+      if (uint32_t(imageInfo.sampleCount) != uint32_t(forcedSamples))
+        Logger::warn(str::format("D7VK: Requested D3D10/11 MSAA count unsupported; requested ",
+          forcedSamples, ", actual ", uint32_t(imageInfo.sampleCount)));
+      Logger::info(str::format("D7VK: D3D10/11 attachment MSAA: ", uint32_t(imageInfo.sampleCount), "x"));
+    }
+
+    // Append a private mip tail without changing application subresource
+    // numbering or reading additional entries from its initial-data array.
+    // Render/UAV writes are regenerated when the texture becomes an SRV;
+    // uploads, copies and clears also refresh the tail while it stays bound.
+    const bool samplingResolve = m_desc.SampleDesc.Count == 1
+      && imageInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT
+      && (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE);
+    auto samplingInfo = imageInfo;
+    if (samplingResolve)
+      samplingInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+
+    bool forcedMipmaps = false;
+    if (pDevice->GetOptions()->graphics.generatesMipmaps()
+     && (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+     && !(m_desc.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))
+     && !(m_desc.MiscFlags & ~(D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_GENERATE_MIPS))
+     && !vkImage && !p11on12Info && !imageInfo.shared
+     && samplingInfo.sampleCount == VK_SAMPLE_COUNT_1_BIT
+     && isColorFormat && !isMultiPlane
+     && CheckFormatFeatureSupport(imageInfo.format,
+          VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT
+        | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+      auto mipImageInfo = samplingInfo;
+      mipImageInfo.mipLevels = util::computeMipLevelCount(imageInfo.extent);
+      mipImageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      mipImageInfo.stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      mipImageInfo.access |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      if (imageInfo.type == VK_IMAGE_TYPE_3D)
+        mipImageInfo.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+      if (mipImageInfo.mipLevels > m_desc.MipLevels
+       && CheckImageSupport(&mipImageInfo, VK_IMAGE_TILING_OPTIMAL)) {
+        samplingInfo = mipImageInfo;
+        if (!samplingResolve)
+          imageInfo = mipImageInfo;
+        forcedMipmaps = true;
+      }
     }
 
     // Some image formats (i.e. the R32G32B32 ones) are
@@ -244,6 +376,29 @@ namespace dxvk {
     else
       m_image = m_device->GetDXVKDevice()->importImage(imageInfo, vkImage, memoryProperties);
 
+    if (samplingResolve) {
+      m_sampledImage = m_device->GetDXVKDevice()->createImage(samplingInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      Logger::debug("D7VK: D3D10/11 internal MSAA attachment uses a single-sample shader view");
+    }
+
+    if (forcedMipmaps) {
+      auto sampledImage = GetSampledImage();
+      DxvkImageViewKey view;
+      view.format = sampledImage->info().format;
+      view.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      view.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+      view.viewType = imageInfo.type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
+        : imageInfo.type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
+        : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      view.mipIndex = m_desc.MipLevels - 1;
+      view.mipCount = sampledImage->info().mipLevels - view.mipIndex;
+      view.layerCount = imageInfo.numLayers;
+      m_forcedMipView = sampledImage->createView(view);
+      Logger::debug(str::format("D7VK: D3D11 generated mip tail: ", m_desc.Width,
+        "x", m_desc.Height, ", app levels=", m_desc.MipLevels,
+        ", internal levels=", sampledImage->info().mipLevels));
+    }
+
     if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
       m_mapPtr = m_image->mapPtr(0);
 
@@ -264,6 +419,16 @@ namespace dxvk {
   
   D3D11CommonTexture::~D3D11CommonTexture() {
     
+  }
+
+  Rc<DxvkImage> D3D11CommonTexture::CreateLogicalImage() const {
+    auto info = m_image->info();
+    info.extent = MipLevelExtent(0);
+    info.mipLevels = std::min(info.mipLevels, util::computeMipLevelCount(info.extent));
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.shared = false;
+    info.sharing = {};
+    return m_device->GetDXVKDevice()->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
   
   
@@ -576,7 +741,8 @@ namespace dxvk {
     // If the packed format and image format don't match, we need to use
     // a staging buffer and perform format conversion when mapping. The
     // same is true if the game is broken and requires tight packing.
-    if (m_packedFormat != pImageInfo->format || device->GetOptions()->disableDirectImageMapping)
+    if (m_packedFormat != pImageInfo->format || device->GetOptions()->disableDirectImageMapping
+     || pImageInfo->mipLevels != m_desc.MipLevels)
       return { D3D11_COMMON_TEXTURE_MAP_MODE_DYNAMIC, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT };
 
     // Multi-plane and depth-stencil images have a special memory layout

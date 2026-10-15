@@ -607,8 +607,20 @@ namespace dxvk {
 
     const D3DOptions* d3dOptions = m_commonIntf->GetOptions();
 
-    if (likely(!d3dOptions->ignoreDisplayModes)) {
-      HRESULT hr = m_proxy->SetDisplayMode(dwWidth, dwHeight, dwBPP);
+    if (likely(!d3dOptions->ignoreDisplayModes && d3dOptions->graphics.windowMode == GraphicsWindow::App)) {
+      HRESULT hr;
+      if (d3dOptions->graphics.refreshRate) {
+        Com<IDirectDraw2> modeInterface;
+        hr = m_proxy->QueryInterface(__uuidof(IDirectDraw2), reinterpret_cast<void**>(&modeInterface));
+        if (SUCCEEDED(hr))
+          hr = modeInterface->SetDisplayMode(dwWidth, dwHeight, dwBPP, d3dOptions->graphics.refreshRate, 0);
+        if (FAILED(hr)) {
+          Logger::warn("D7VK: Forced refresh unavailable; retrying the application's DirectDraw display mode");
+          hr = m_proxy->SetDisplayMode(dwWidth, dwHeight, dwBPP);
+        }
+      } else {
+        hr = m_proxy->SetDisplayMode(dwWidth, dwHeight, dwBPP);
+      }
       if (unlikely(FAILED(hr)))
         return hr;
 

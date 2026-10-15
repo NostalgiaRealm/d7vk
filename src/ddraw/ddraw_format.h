@@ -905,6 +905,9 @@ namespace dxvk {
         d3d9::IDirect3DSurface9* surface9,
         SurfaceType* surface,
         const bool isDXTFormat) {
+    d3d9::D3DSURFACE_DESC desc9;
+    if (FAILED(surface9->GetDesc(&desc9)))
+      return;
     d3d9::D3DLOCKED_RECT rect9;
     // D3DLOCK_DISCARD will get ignored for MANAGED/SYSTEMMEM, but will work on DEFAULT
     HRESULT hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_DISCARD);
@@ -913,9 +916,12 @@ namespace dxvk {
       desc.dwSize = sizeof(DescType);
       HRESULT hr = surface->Lock(NULL, &desc, DDLOCK_READONLY, NULL);
       if (likely(SUCCEEDED(hr))) {
+        // A resized backbuffer can be smaller than Wine's desktop-sized
+        // DirectDraw surface. Never copy beyond the logical D3D9 lock.
+        const uint32_t copyHeight = std::min<uint32_t>(desc.dwHeight, desc9.Height);
         // The lock pitch of a DXT surface represents its entire size, apparently
         if (isDXTFormat) {
-          const size_t size = static_cast<size_t>(desc.lPitch);
+          const size_t size = std::min<size_t>(desc.lPitch, size_t(rect9.Pitch) * ((copyHeight + 3) / 4));
           memcpy(rect9.pBits, desc.lpSurface, size);
           //Logger::debug("BlitToD3D9Surface: Done blitting DXT surface");
         } else if (desc.lPitch != rect9.Pitch) {
@@ -925,14 +931,14 @@ namespace dxvk {
           uint8_t* data7 = reinterpret_cast<uint8_t*>(desc.lpSurface);
 
           const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
-          for (uint32_t h = 0; h < desc.dwHeight; h++) {
+          for (uint32_t h = 0; h < copyHeight; h++) {
             memcpy(data9, data7, copyPitch);
             data9 += rect9.Pitch;
             data7 += desc.lPitch;
           }
           //Logger::debug("BlitToD3D9Surface: Done blitting surface row by row");
         } else {
-          const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
+          const size_t size = size_t(copyHeight) * desc.lPitch;
           memcpy(rect9.pBits, desc.lpSurface, size);
           //Logger::debug("BlitToD3D9Surface: Done blitting surface");
         }
@@ -951,6 +957,9 @@ namespace dxvk {
         SurfaceType* surface,
         d3d9::IDirect3DSurface9* surface9,
         const bool isDXTFormat) {
+    d3d9::D3DSURFACE_DESC desc9;
+    if (FAILED(surface9->GetDesc(&desc9)))
+      return;
     DescType desc;
     desc.dwSize = sizeof(DescType);
     HRESULT hr = surface->Lock(NULL, &desc, DDLOCK_WRITEONLY, NULL);
@@ -958,9 +967,10 @@ namespace dxvk {
       d3d9::D3DLOCKED_RECT rect9;
       HRESULT hr9 = surface9->LockRect(&rect9, NULL, D3DLOCK_READONLY);
       if (likely(SUCCEEDED(hr9))) {
+        const uint32_t copyHeight = std::min<uint32_t>(desc.dwHeight, desc9.Height);
         // The lock pitch of a DXT surface represents its entire size, apparently
         if (unlikely(isDXTFormat)) {
-          const size_t size = static_cast<size_t>(desc.lPitch);
+          const size_t size = std::min<size_t>(desc.lPitch, size_t(rect9.Pitch) * ((copyHeight + 3) / 4));
           memcpy(desc.lpSurface, rect9.pBits, size);
           //Logger::debug("BlitToDDrawSurface: Done blitting DXT surface");
         } else if (desc.lPitch != rect9.Pitch) {
@@ -970,14 +980,14 @@ namespace dxvk {
           uint8_t* data9 = reinterpret_cast<uint8_t*>(rect9.pBits);
 
           const size_t copyPitch = std::min<size_t>(desc.lPitch, rect9.Pitch);
-          for (uint32_t h = 0; h < desc.dwHeight; h++) {
+          for (uint32_t h = 0; h < copyHeight; h++) {
             memcpy(data7, data9, copyPitch);
             data7 += desc.lPitch;
             data9 += rect9.Pitch;
           }
           //Logger::debug("BlitToDDrawSurface: Done blitting surface row by row");
         } else {
-          const size_t size = static_cast<size_t>(desc.dwHeight * desc.lPitch);
+          const size_t size = size_t(copyHeight) * desc.lPitch;
           memcpy(desc.lpSurface, rect9.pBits, size);
           //Logger::debug("BlitToDDrawSurface: Done blitting surface");
         }

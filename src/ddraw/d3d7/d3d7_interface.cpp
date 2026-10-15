@@ -293,7 +293,7 @@ namespace dxvk {
 
     // Determine the supported AA sample count by querying the D3D9 interface
     const d3d9::D3DMULTISAMPLE_TYPE multiSampleType = d3dOptions->emulateFSAA != FSAAEmulation::Disabled ?
-                                                      m_commonD3DIntf->GetMultiSampleType(backBufferFormat) :
+                                                      m_commonD3DIntf->GetMultiSampleType(backBufferFormat, d3dOptions->graphics.msaa > 0 ? d3dOptions->graphics.msaa : 4) :
                                                       d3d9::D3DMULTISAMPLE_NONE;
 
     // Always appears to be enabled when running in non-exclusive mode

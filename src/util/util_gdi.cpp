@@ -1,7 +1,22 @@
 #include "util_gdi.h"
+#include "util_window.h"
 #include "log/log.h"
 
 namespace dxvk {
+
+  void ClearWindowPresentRect(HWND window) {
+#ifdef _WIN32
+    RECT empty = {};
+    D3DKMT_ESCAPE escape = {};
+    escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
+    escape.pPrivateDriverData = &empty;
+    escape.PrivateDriverDataSize = sizeof(empty);
+    escape.hContext = HandleToUlong(window);
+    D3DKMTEscape(&escape);
+#else
+    (void)window;
+#endif
+  }
 
 #ifndef _WIN32
   NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(D3DKMT_ACQUIREKEYEDMUTEX *desc) {

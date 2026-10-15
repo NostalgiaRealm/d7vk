@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../util/config/config.h"
+#include "../util/config/graphics_options.h"
 
 #include "../dxvk/dxvk_include.h"
 
@@ -15,6 +16,7 @@ namespace dxvk {
    * behaviour of some DXGI classes.
    */
   struct DxgiOptions {
+    GraphicsOptions graphics;
     DxgiOptions(const Config& config);
 
     void incRef() {

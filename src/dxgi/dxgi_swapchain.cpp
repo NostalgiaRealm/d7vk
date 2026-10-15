@@ -3,6 +3,7 @@
 #include "dxgi_swapchain.h"
 
 #include "../util/util_misc.h"
+#include "../util/config/graphics_window.h"
 
 #include <d3d12.h>
 
@@ -40,6 +41,13 @@ namespace dxvk {
     m_factory->QueryInterface(__uuidof(IDXGIVkMonitorInfo), reinterpret_cast<void**>(&m_monitorInfo));
     
     // Apply initial window mode and fullscreen state
+    const auto& graphics = m_factory->GetOptions()->graphics;
+    if (graphics.windowMode != GraphicsWindow::App)
+      m_descFs.Windowed = TRUE;
+    if (graphics.refreshRate)
+      m_descFs.RefreshRate = { graphics.refreshRate, 1 };
+    ApplyGraphicsWindowMode(m_window, graphics.windowMode, m_desc.Width, m_desc.Height);
+
     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
     {
       Logger::warn("DXGI: EnterFullscreenMode failed. Creating a windowed swapchain instead.");
@@ -362,8 +370,15 @@ namespace dxvk {
 
     auto options = m_factory->GetOptions();
 
+    ApplyGraphicsWindowMode(m_window, options->graphics.windowMode, m_desc.Width, m_desc.Height);
+
     if (options->syncInterval >= 0)
       SyncInterval = options->syncInterval;
+
+    if (options->graphics.forceVSync) {
+      SyncInterval = std::max(SyncInterval, 1u);
+      PresentFlags &= ~DXGI_PRESENT_ALLOW_TEARING;
+    }
 
     UpdateGlobalHDRState();
 
@@ -486,6 +501,10 @@ namespace dxvk {
     newDisplayMode.ScanlineOrdering = pNewTargetParameters->ScanlineOrdering;
     newDisplayMode.Scaling = pNewTargetParameters->Scaling;
 
+    const auto& graphics = m_factory->GetOptions()->graphics;
+    if (graphics.refreshRate)
+      newDisplayMode.RefreshRate = { graphics.refreshRate, 1 };
+
     // Update the swap chain description
     if (newDisplayMode.RefreshRate.Numerator != 0)
       m_descFs.RefreshRate = newDisplayMode.RefreshRate;
@@ -498,6 +517,7 @@ namespace dxvk {
         m_window, &m_windowState,
         newDisplayMode.Width,
         newDisplayMode.Height);
+      ApplyGraphicsWindowMode(m_window, graphics.windowMode, newDisplayMode.Width, newDisplayMode.Height);
     } else {
       Com<IDXGIOutput1> output;
       
@@ -530,6 +550,11 @@ namespace dxvk {
           BOOL          Fullscreen,
           IDXGIOutput*  pTarget) {
     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
+
+    if (m_factory->GetOptions()->graphics.windowMode != GraphicsWindow::App) {
+      Fullscreen = FALSE;
+      pTarget = nullptr;
+    }
 
     if (!Fullscreen && pTarget)
       return DXGI_ERROR_INVALID_CALL;
@@ -870,6 +895,13 @@ namespace dxvk {
     HRESULT hr = pOutput->FindClosestMatchingMode1(
       &preferredMode, &selectedMode, nullptr);
 
+    const bool forcedRefresh = m_factory->GetOptions()->graphics.refreshRate != 0;
+    if (FAILED(hr) && forcedRefresh) {
+      Logger::warn("D7VK: Forced refresh unavailable; retrying the display mode with default refresh");
+      preferredMode.RefreshRate = { 0, 0 };
+      hr = pOutput->FindClosestMatchingMode1(&preferredMode, &selectedMode, nullptr);
+    }
+
     if (FAILED(hr)) {
       Logger::err(str::format(
         "DXGI: Failed to query closest mode:",
@@ -882,8 +914,19 @@ namespace dxvk {
     if (!selectedMode.RefreshRate.Denominator)
       selectedMode.RefreshRate.Denominator = 1;
 
-    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, &m_windowState, ConvertDisplayMode(selectedMode)))
-      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, &m_windowState, ConvertDisplayMode(selectedMode))) {
+      if (!forcedRefresh)
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+      Logger::warn("D7VK: Forced refresh mode failed; retrying the display mode with default refresh");
+      preferredMode.RefreshRate = { 0, 0 };
+      hr = pOutput->FindClosestMatchingMode1(&preferredMode, &selectedMode, nullptr);
+      if (FAILED(hr))
+        return hr;
+      if (!selectedMode.RefreshRate.Denominator)
+        selectedMode.RefreshRate.Denominator = 1;
+      if (!wsi::setWindowMode(outputDesc.Monitor, m_window, &m_windowState, ConvertDisplayMode(selectedMode)))
+        return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    }
 
     DXGI_VK_MONITOR_DATA* monitorData = nullptr;
 

@@ -14,7 +14,10 @@ namespace dxvk {
     enableImplicitResolves = config.getOption<bool>   ("dxvk.enableImplicitResolves", true);
     enableNvRawAccessChains = config.getOption<bool>  ("dxvk.enableNvRawAccessChains", true);
     enableNvCudaInterop   = config.getOption<bool>    ("dxvk.enableNvCudaInterop",    true);
-    enablePresentTiming   = config.getOption<bool>    ("dxvk.enablePresentTiming",    true);
+    // Keep the documented opt-in default. Some Wine Vulkan bridges advertise
+    // this extension but fault inside its query calls, before error handling
+    // in the presenter can fall back to ordinary presentation.
+    enablePresentTiming   = config.getOption<bool>    ("dxvk.enablePresentTiming",    false);
     trackPipelineLifetime = config.getOption<Tristate>("dxvk.trackPipelineLifetime",  Tristate::Auto);
     useRawSsbo            = config.getOption<Tristate>("dxvk.useRawSsbo",             Tristate::Auto);
     hud                   = config.getOption<std::string>("dxvk.hud", "");

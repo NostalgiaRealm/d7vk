@@ -13,6 +13,7 @@ namespace dxvk {
   }
 
   D3D11Options::D3D11Options(const Config& config) {
+    graphics = GraphicsOptions(config);
     this->forceComputeLdsBarriers = config.getOption<bool>("d3d11.forceComputeLdsBarriers", false);
     this->forceComputeUavBarriers = config.getOption<bool>("d3d11.forceComputeUavBarriers", false);
     this->relaxedBarriers       = config.getOption<bool>("d3d11.relaxedBarriers", false);
@@ -23,6 +24,8 @@ namespace dxvk {
     this->clampNegativeLodBias  = config.getOption<bool>("d3d11.clampNegativeLodBias", false);
     this->forceSampleRateShading = config.getOption<bool>("d3d11.forceSampleRateShading", false);
     this->disableMsaa           = config.getOption<bool>("d3d11.disableMsaa", false);
+    if (graphics.msaa >= 0)
+      this->disableMsaa = graphics.msaa == 0;
     this->enableContextLock     = config.getOption<bool>("d3d11.enableContextLock", false);
     this->deferSurfaceCreation  = config.getOption<bool>("dxgi.deferSurfaceCreation", false);
     this->maxFrameLatency       = config.getOption<int32_t>("dxgi.maxFrameLatency", 0);

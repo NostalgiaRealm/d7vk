@@ -2,6 +2,7 @@
 
 #include "ddraw_include.h"
 #include "ddraw_options.h"
+#include "../util/config/graphics_window.h"
 
 #include <unordered_set>
 #include <unordered_map>
@@ -113,6 +114,14 @@ namespace dxvk {
     void SetCooperativeLevel(HWND hWnd, DWORD dwFlags) {
       m_hWnd = hWnd;
       m_cooperativeLevel = dwFlags;
+#ifdef _WIN32
+      if (m_d3dOptions.graphics.windowMode != GraphicsWindow::App && hWnd) {
+        RECT rect = {};
+        GetClientRect(hWnd, &rect);
+        ApplyGraphicsWindowMode(hWnd, m_d3dOptions.graphics.windowMode,
+          std::max<LONG>(1, rect.right), std::max<LONG>(1, rect.bottom));
+      }
+#endif
     }
 
     DWORD GetCooperativeLevel() const {

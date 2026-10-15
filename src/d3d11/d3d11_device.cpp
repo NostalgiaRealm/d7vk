@@ -48,14 +48,18 @@ namespace dxvk {
     m_featureFlags      (FeatureFlags),
     m_dxvkDevice        (pContainer->GetDXVKDevice()),
     m_dxvkAdapter       (m_dxvkDevice->adapter()),
-    m_d3d11Formats      (m_dxvkDevice),
     m_d3d11Options      (m_dxvkDevice->instance()->config()),
+    m_d3d11Formats      (m_dxvkDevice, m_d3d11Options.graphics.depthBits),
     m_shaderOptions     (GetShaderOptions(m_dxvkDevice, m_d3d11Options)),
     m_maxFeatureLevel   (D3D11DeviceFeatures::GetMaxFeatureLevel(*m_dxvkDevice)),
     m_deviceFeatures    (*m_dxvkDevice, m_d3d11Options, m_featureLevel) {
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     m_d3d10Device = new D3D10Device(this, m_context.ptr());
+    if (m_d3d11Options.graphics.msaa > 0)
+      Logger::info("D7VK: D3D10/11 MSAA override covers regular 2D attachments, resolved shader views, and existing MSAA; "
+        "shared, interop, UAV, mapped, cube and multiple-mip resources retain their application layout; "
+        "passes mixing promoted and unpromoted targets may be incompatible");
   }
   
   

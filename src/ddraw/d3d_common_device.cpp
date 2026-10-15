@@ -58,6 +58,18 @@ namespace dxvk {
     return nullptr;
   }
 
+  const RECT* D3DCommonDevice::GetPresentRect() const {
+    // This rectangle fits a resized back buffer into the native fullscreen
+    // primary surface. A forced window uses the logical back-buffer size as
+    // its client area, so Present must fit that client instead of retaining
+    // the desktop-sized destination and clipping the image.
+    if (!m_aspectRatioCorrection
+     || m_commonIntf->GetOptions()->graphics.windowMode != GraphicsWindow::App)
+      return nullptr;
+
+    return &m_presentRect;
+  }
+
   // D3D5/3 has no way of disabling/re-enabling VSync, so skip the D3D5/3 devices
   HRESULT D3DCommonDevice::ResetD3D9Swapchain(d3d9::D3DPRESENT_PARAMETERS* params) {
     if (m_device7 != nullptr) {

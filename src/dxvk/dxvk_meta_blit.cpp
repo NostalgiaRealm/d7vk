@@ -11,6 +11,7 @@ namespace dxvk {
     ir::SsaDef sampler = { };
     ir::SsaDef layerIndex = { };
     ir::SsaDef layerCount = { };
+    ir::SsaDef stencilBit = { };
   };
 
 
@@ -23,6 +24,7 @@ namespace dxvk {
     result.sampler = helper.declareSampler(builder, offsetof(DxvkMetaBlit::Args, sampler), "filter");
     result.layerIndex = helper.declarePushData(builder, ir::ScalarType::eU32, offsetof(DxvkMetaBlit::Args, layerIndex), "layerIndex");
     result.layerCount = helper.declarePushData(builder, ir::ScalarType::eU32, offsetof(DxvkMetaBlit::Args, layerCount), "layerCount");
+    result.stencilBit = helper.declarePushData(builder, ir::ScalarType::eU32, offsetof(DxvkMetaBlit::Args, stencilBit), "stencilBit");
     return result;
   }
 
@@ -166,6 +168,19 @@ namespace dxvk {
 
     if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
       helper.exportBuiltIn(builder, ir::BuiltIn::eDepth, value);
+    else if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+      auto stencil = value;
+      if (m_device->features().extShaderStencilExport) {
+        helper.exportBuiltIn(builder, ir::BuiltIn::eStencilRef, stencil);
+      } else {
+        auto cond = builder.add(ir::Op::IEq(ir::ScalarType::eBool,
+          builder.add(ir::Op::IAnd(ir::ScalarType::eU32, stencil, pushArgs.stencilBit)),
+          builder.makeConstant(0u)));
+        auto merge = helper.emitConditionalBlock(builder, cond);
+        builder.add(ir::Op::Demote());
+        builder.setCursor(merge);
+      }
+    }
     else
       helper.exportOutput(builder, 0u, value, "color");
 
@@ -424,8 +439,8 @@ namespace dxvk {
 
     auto formatInfo = lookupFormatInfo(key.dstFormat);
 
-    VkImageAspectFlagBits aspect = VkImageAspectFlagBits(
-      formatInfo->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT));
+    VkImageAspectFlagBits aspect = VkImageAspectFlagBits(key.dstAspect ? key.dstAspect
+      : formatInfo->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT));
 
     auto vsSpirv = createVs(key, aspect, result.layout);
     auto psSpirv = (key.srcSamples == VK_SAMPLE_COUNT_1_BIT)
@@ -439,7 +454,25 @@ namespace dxvk {
     state.fs = psSpirv;
     state.sampleCount = key.dstSamples;
     state.colorFormats[0] = aspect == VK_IMAGE_ASPECT_COLOR_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
-    state.depthFormat = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
+    state.depthFormat = aspect != VK_IMAGE_ASPECT_COLOR_BIT ? key.dstFormat : VK_FORMAT_UNDEFINED;
+
+    // Only write the selected aspect. Combined-format images retain the
+    // other aspect while scaling depth and stencil in separate passes.
+    VkPipelineDepthStencilStateCreateInfo dsState = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dsState.depthTestEnable = aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+    dsState.depthWriteEnable = aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+    dsState.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    dsState.stencilTestEnable = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+    dsState.front.failOp = dsState.front.passOp = dsState.front.depthFailOp = VK_STENCIL_OP_REPLACE;
+    dsState.front.compareOp = VK_COMPARE_OP_ALWAYS;
+    dsState.front.writeMask = dsState.front.compareMask = dsState.front.reference = 0xffu;
+    dsState.back = dsState.front;
+    state.dsState = &dsState;
+    const VkDynamicState stencilMask = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK;
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT && !m_device->features().extShaderStencilExport) {
+      state.dynamicStateCount = 1;
+      state.dynamicStates = &stencilMask;
+    }
 
     result.pipeline = m_device->createBuiltInGraphicsPipeline(result.layout, state);
     return result;
@@ -451,6 +484,8 @@ namespace dxvk {
     name << "meta_" << type << "_blit";
     name << "_" << str::format(key.srcViewType).substr(std::strlen("VK_IMAGE_VIEW_TYPE_"));
     name << "_" << str::format(key.dstFormat).substr(std::strlen("VK_FORMAT_"));
+    if (key.dstAspect == VK_IMAGE_ASPECT_STENCIL_BIT)
+      name << "_stencil";
 
     if (key.dstSamples > VK_SAMPLE_COUNT_1_BIT)
       name << "_msx" << uint32_t(key.dstSamples);

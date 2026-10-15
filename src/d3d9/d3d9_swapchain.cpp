@@ -4,6 +4,7 @@
 
 #include "d3d9_hud.h"
 #include "d3d9_window.h"
+#include "../util/config/graphics_window.h"
 
 namespace dxvk {
 
@@ -34,6 +35,7 @@ namespace dxvk {
     if (FAILED(CreateBackBuffers(m_presentParams.BackBufferCount, m_presentParams.Flags)))
       throw DxvkError("D3D9: Failed to create swapchain backbuffers");
 
+    UpdatePresentRegion(nullptr, nullptr);
     CreateBlitter();
 
     InitRamp();
@@ -140,10 +142,16 @@ namespace dxvk {
     if (options->presentInterval >= 0)
       presentInterval = options->presentInterval;
 
+    if (options->graphics.forceVSync)
+      presentInterval = std::max(presentInterval, 1u);
+
     HWND window = m_presentParams.hDeviceWindow;
 
     if (hDestWindowOverride != nullptr)
       window = hDestWindowOverride;
+
+    ApplyGraphicsWindowMode(window, options->graphics.windowMode,
+      m_presentParams.BackBufferWidth, m_presentParams.BackBufferHeight);
 
     if (m_window != window) {
       m_window = window;
@@ -225,9 +233,19 @@ namespace dxvk {
       return D3DERR_DEVICEREMOVED;
     }
 
+    RECT source = m_srcRect;
+    auto* texture = m_backBuffers[0]->GetCommonTexture();
+    if (texture->IsScaled()) {
+      auto logical = texture->GetExtent();
+      auto physical = texture->GetImage()->info().extent;
+      source.left = int64_t(source.left) * logical.width / physical.width;
+      source.right = int64_t(source.right) * logical.width / physical.width;
+      source.top = int64_t(source.top) * logical.height / physical.height;
+      source.bottom = int64_t(source.bottom) * logical.height / physical.height;
+    }
     bool success = StretchBlt(dstDC, m_dstRect.left, m_dstRect.top, m_dstRect.right - m_dstRect.left,
-            m_dstRect.bottom - m_dstRect.top, hDC, m_srcRect.left, m_srcRect.top,
-            m_srcRect.right - m_srcRect.left, m_srcRect.bottom - m_srcRect.top, SRCCOPY);
+            m_dstRect.bottom - m_dstRect.top, hDC, source.left, source.top,
+            source.right - source.left, source.bottom - source.top, SRCCOPY);
 
     m_backBuffers[0]->ReleaseDC(hDC);
     ReleaseDC(Window, dstDC);
@@ -392,6 +410,12 @@ namespace dxvk {
       blitInfo.dstOffsets[1] = VkOffset3D{ int32_t(srcExtent.width),  int32_t(srcExtent.height),  1 };
       blitInfo.srcOffsets[0] = VkOffset3D{ 0, 0, 0 };
       blitInfo.srcOffsets[1] = VkOffset3D{ int32_t(srcExtent.width),  int32_t(srcExtent.height),  1 };
+
+      if (srcTexInfo->IsScaled()) {
+        uint32_t width, height;
+        wsi::getWindowSize(m_window, &width, &height);
+        blitInfo.dstOffsets[1] = { int32_t(width), int32_t(height), 1 };
+      }
 
 #ifdef _WIN32
       if (m_presentParams.Windowed) {
@@ -842,8 +866,17 @@ namespace dxvk {
     if (pPresentParams->BackBufferFormat == D3DFMT_UNKNOWN)
       pPresentParams->BackBufferFormat = D3DFMT_X8R8G8B8;
 
-    if (env::getEnvVar("DXVK_FORCE_WINDOWED") == "1")
-      pPresentParams->Windowed         = TRUE;
+    const auto& graphics = m_parent->GetOptions()->graphics;
+    m_parent->SetRenderResolution(pPresentParams->BackBufferWidth, pPresentParams->BackBufferHeight);
+    if (env::getEnvVar("DXVK_FORCE_WINDOWED") == "1" || graphics.windowMode != GraphicsWindow::App)
+      pPresentParams->Windowed = TRUE;
+    if (pPresentParams->Windowed)
+      pPresentParams->FullScreen_RefreshRateInHz = 0;
+    else if (graphics.refreshRate)
+      pPresentParams->FullScreen_RefreshRateInHz = graphics.refreshRate;
+
+    ApplyGraphicsWindowMode(pPresentParams->hDeviceWindow, graphics.windowMode,
+      pPresentParams->BackBufferWidth, pPresentParams->BackBufferHeight);
   }
 
 
@@ -1306,12 +1339,30 @@ namespace dxvk {
       mode.Size             = sizeof(D3DDISPLAYMODEEX);
     }
 
+    const auto& graphics = m_parent->GetOptions()->graphics;
+    D3DDISPLAYMODEEX fallbackMode = mode;
+    if (graphics.refreshRate)
+      fallbackMode.RefreshRate = 0;
+    if (graphics.scalesResolution()) {
+      auto extent = m_parent->GetRenderExtent({ pPresentParams->BackBufferWidth, pPresentParams->BackBufferHeight, 1 });
+      mode.Width = extent.width;
+      mode.Height = extent.height;
+    }
+    if (graphics.refreshRate)
+      mode.RefreshRate = graphics.refreshRate;
+
     wsi::WsiMode wsiMode = ConvertDisplayMode(mode);
     
     HMONITOR monitor = wsi::getDefaultMonitor();
 
-    if (!wsi::setWindowMode(monitor, m_window, &m_windowState, wsiMode))
-      return D3DERR_NOTAVAILABLE;
+    if (!wsi::setWindowMode(monitor, m_window, &m_windowState, wsiMode)) {
+      if (!graphics.scalesResolution() && !graphics.refreshRate)
+        return D3DERR_NOTAVAILABLE;
+      Logger::warn("D7VK: Forced display mode unavailable; keeping forced rendering with the application display size and default refresh");
+      wsiMode = ConvertDisplayMode(fallbackMode);
+      if (!wsi::setWindowMode(monitor, m_window, &m_windowState, wsiMode))
+        return D3DERR_NOTAVAILABLE;
+    }
 
     m_displayRefreshRate = 0.0;
 
@@ -1350,6 +1401,13 @@ namespace dxvk {
       m_srcRect = *pSourceRect;
     }
     
+    if (!m_backBuffers.empty()) {
+      auto* texture = m_backBuffers[0]->GetCommonTexture();
+      auto first = texture->ScaleOffset({ m_srcRect.left, m_srcRect.top, 0 });
+      auto last = texture->ScaleOffset({ m_srcRect.right, m_srcRect.bottom, 1 });
+      m_srcRect = { first.x, first.y, last.x, last.y };
+    }
+
     UINT width, height;
     wsi::getWindowSize(m_window, &width, &height);
 

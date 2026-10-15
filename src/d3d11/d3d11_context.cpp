@@ -3,6 +3,7 @@
 #include "d3d11_context.h"
 #include "d3d11_context_def.h"
 #include "d3d11_context_imm.h"
+#include "../dxvk/dxvk_resolution.h"
 
 namespace dxvk {
 
@@ -476,6 +477,8 @@ namespace dxvk {
       ctx->clearRenderTarget(cAttachment,
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
+
+    GenerateForcedMipmaps(GetCommonTexture(rtv->GetViewInfo().pResource));
   }
 
 
@@ -620,6 +623,8 @@ namespace dxvk {
           VK_IMAGE_ASPECT_COLOR_BIT,
           cClearValue);
       });
+
+      GenerateForcedMipmaps(GetCommonTexture(uav->GetViewInfo().pResource));
     }
   }
 
@@ -674,6 +679,8 @@ namespace dxvk {
           VK_IMAGE_ASPECT_COLOR_BIT,
           cClearValue);
       });
+
+      GenerateForcedMipmaps(GetCommonTexture(uav->GetViewInfo().pResource));
     }
   }
 
@@ -723,6 +730,8 @@ namespace dxvk {
       ctx->clearRenderTarget(cAttachment,
         cAspectMask, cClearValue, 0u);
     });
+
+    GenerateForcedMipmaps(GetCommonTexture(dsv->GetViewInfo().pResource));
   }
 
 
@@ -757,12 +766,32 @@ namespace dxvk {
     auto uav = static_cast<D3D11UnorderedAccessView*>(qiUav.ptr());
     auto vov = static_cast<D3D11VideoProcessorOutputView*>(qiVov.ptr());
 
+    std::vector<D3D11_RECT> scaledRects;
+    if (NumRects && (rtv || dsv)) {
+      auto resource = rtv ? rtv->GetViewInfo().pResource : dsv->GetViewInfo().pResource;
+      auto texture = GetCommonTexture(resource);
+      auto view = rtv ? rtv->GetImageView() : dsv->GetImageView();
+      if (texture && texture->IsScaled() && view) {
+        scaledRects.assign(pRect, pRect + NumRects);
+        for (auto& rect : scaledRects) {
+          VkOffset3D offset = { rect.left, rect.top, 0 };
+          VkExtent3D extent = { uint32_t(std::max(0L, rect.right - rect.left)),
+                                uint32_t(std::max(0L, rect.bottom - rect.top)), 1 };
+          texture->ScaleRegion(offset, extent, view->info().mipIndex);
+          rect = { offset.x, offset.y, offset.x + LONG(extent.width), offset.y + LONG(extent.height) };
+        }
+        pRect = scaledRects.data();
+      }
+    }
+
     // Retrieve underlying resource view
     if (dsv) {
       Rc<DxvkImageView> imgView = dsv->GetImageView();
 
       if (imgView)
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
+
+      GenerateForcedMipmaps(GetCommonTexture(dsv->GetViewInfo().pResource));
     } else if (rtv) {
       Rc<DxvkImageView> imgView = rtv->GetImageView();
       Rc<DxvkBufferView> bufView = rtv->GetBufferView();
@@ -774,6 +803,8 @@ namespace dxvk {
 
       if (imgView)
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
+
+      GenerateForcedMipmaps(GetCommonTexture(rtv->GetViewInfo().pResource));
     } else if (uav) {
       Rc<DxvkImageView> imgView = uav->GetImageView();
       Rc<DxvkBufferView> bufView = uav->GetBufferView();
@@ -783,6 +814,8 @@ namespace dxvk {
 
       if (bufView)
         ClearBufferView(std::move(bufView), Color, pRect, NumRects);
+
+      GenerateForcedMipmaps(GetCommonTexture(uav->GetViewInfo().pResource));
     } else if (vov) {
       auto views = vov->GetCommon().GetViews();
       auto shadow = vov->GetCommon().GetShadow();
@@ -828,6 +861,23 @@ namespace dxvk {
 
 
   template<typename ContextType>
+  void D3D11CommonContext<ContextType>::GenerateForcedMipmaps(D3D11CommonTexture* texture) {
+    if (!texture || (!texture->GetForcedMipView() && !texture->NeedsSamplingResolve()))
+      return;
+
+    EmitCs([
+      cRender = texture->GetImage(),
+      cSampled = texture->GetSampledImage(),
+      cView = texture->GetForcedMipView(),
+      cFilter = m_parent->GetOptions()->graphics.mipmapping == GraphicsMipmaps::Point
+        ? VK_FILTER_NEAREST : VK_FILTER_LINEAR
+    ] (DxvkContext* ctx) {
+      UpdateD3D11SampledImage(ctx, cRender, cSampled, cView, cFilter);
+    });
+  }
+
+
+  template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::GenerateMips(ID3D11ShaderResourceView* pShaderResourceView) {
     D3D10DeviceLock lock = LockContext();
 
@@ -841,11 +891,18 @@ namespace dxvk {
     if (!(resourceDesc.MiscFlags & D3D11_RESOURCE_MISC_GENERATE_MIPS))
       return;
 
+    auto texture = GetCommonTexture(view->GetViewInfo().pResource);
+    if (texture->NeedsSamplingResolve())
+      GenerateForcedMipmaps(texture);
+
     AddCost(GpuCostEstimate::Transfer);
 
-    EmitCs([cDstImageView = view->GetImageView()]
+    EmitCs([
+      cDstImageView = view->GetImageView(),
+      cFilter = m_parent->GetOptions()->graphics.mipmapping == GraphicsMipmaps::Point
+        ? VK_FILTER_NEAREST : VK_FILTER_LINEAR]
     (DxvkContext* ctx) {
-      ctx->generateMipmaps(cDstImageView, VK_FILTER_LINEAR);
+      ctx->generateMipmaps(cDstImageView, cFilter);
     });
   }
 
@@ -920,7 +977,55 @@ namespace dxvk {
       srcSubresource.mipLevel,
       srcSubresource.arrayLayer, 1 };
 
-    if (srcDesc.SampleDesc.Count == 1 || m_parent->GetOptions()->disableMsaa) {
+    if (dstTextureInfo->GetImage()->mipLevelExtent(dstSubresource.mipLevel)
+     != srcTextureInfo->GetImage()->mipLevelExtent(srcSubresource.mipLevel)) {
+      VkFormat format = m_parent->LookupFormat(Format, DXGI_VK_FORMAT_MODE_ANY).Format;
+      EmitCs([cDst = dstTextureInfo->GetImage(), cSrc = srcTextureInfo->GetImage(),
+              cDstLayers = dstSubresourceLayers, cSrcLayers = srcSubresourceLayers,
+              cFormat = format, cDevice = m_device] (DxvkContext* ctx) {
+        VkFormat format = cFormat ? cFormat : cSrc->info().format;
+        Rc<DxvkImage> source = cSrc;
+        // Resolve before resizing, retaining the caller's interpretation of
+        // typeless pixels (including sRGB and integer resolve semantics).
+        if (source->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+          auto info = source->info();
+          info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+          info.shared = false;
+          info.sharing = {};
+          source = cDevice->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+          VkImageResolve region = {};
+          region.srcSubresource = cSrcLayers;
+          region.dstSubresource = cSrcLayers;
+          region.extent = cSrc->mipLevelExtent(cSrcLayers.mipLevel);
+          ctx->resolveImage(source, cSrc, region, format,
+            getDefaultResolveMode(format), VK_RESOLVE_MODE_NONE);
+        }
+
+        DxvkImageViewKey key;
+        key.format = format;
+        key.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        key.aspects = cSrcLayers.aspectMask;
+        key.mipIndex = cSrcLayers.mipLevel;
+        key.mipCount = 1;
+        key.layerIndex = cSrcLayers.baseArrayLayer;
+        key.layerCount = cSrcLayers.layerCount;
+        key.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        auto srcView = source->createView(key);
+        key.aspects = cDstLayers.aspectMask;
+        key.mipIndex = cDstLayers.mipLevel;
+        key.layerIndex = cDstLayers.baseArrayLayer;
+        key.layerCount = cDstLayers.layerCount;
+        key.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        auto dstView = cDst->createView(key);
+        auto srcExtent = srcView->mipLevelExtent(0);
+        auto dstExtent = dstView->mipLevelExtent(0);
+        VkOffset3D srcOffsets[2] = {{ 0, 0, 0 },
+          { int32_t(srcExtent.width), int32_t(srcExtent.height), 1 }};
+        VkOffset3D dstOffsets[2] = {{ 0, 0, 0 },
+          { int32_t(dstExtent.width), int32_t(dstExtent.height), 1 }};
+        ctx->blitImageView(dstView, dstOffsets, srcView, srcOffsets, VK_FILTER_NEAREST);
+      });
+    } else if (srcDesc.SampleDesc.Count == 1 || m_parent->GetOptions()->disableMsaa) {
       EmitCs([
         cDstImage  = dstTextureInfo->GetImage(),
         cSrcImage  = srcTextureInfo->GetImage(),
@@ -959,6 +1064,8 @@ namespace dxvk {
 
     if constexpr (!IsDeferred)
       GetTypedContext()->NotifyResolve();
+
+    GenerateForcedMipmaps(dstTextureInfo);
 
     if (dstTextureInfo->HasSequenceNumber())
       GetTypedContext()->TrackTextureSequenceNumber(dstTextureInfo, DstSubresource);
@@ -3505,6 +3612,30 @@ namespace dxvk {
   void D3D11CommonContext<ContextType>::ApplyViewportState() {
     uint32_t viewportCount = m_state.rs.numViewports;
 
+    float scaleX = 1.0f, scaleY = 1.0f;
+    if (m_parent->GetOptions()->graphics.scalesResolution()) {
+      ID3D11Resource* resource = nullptr;
+      Rc<DxvkImageView> view;
+      for (const auto& rtv : m_state.om.rtvs) {
+        if (rtv) {
+          resource = rtv->GetViewInfo().pResource;
+          view = rtv->GetImageView();
+          break;
+        }
+      }
+      if (!resource && m_state.om.dsv) {
+        resource = m_state.om.dsv->GetViewInfo().pResource;
+        view = m_state.om.dsv->GetImageView();
+      }
+      auto texture = resource ? GetCommonTexture(resource) : nullptr;
+      if (texture && texture->IsScaled() && view) {
+        auto logical = texture->MipLevelExtent(view->info().mipIndex);
+        auto physical = view->mipLevelExtent(0);
+        scaleX = float(physical.width) / logical.width;
+        scaleY = float(physical.height) / logical.height;
+      }
+    }
+
     if (likely(viewportCount)) {
       EmitCsCmd<DxvkViewport>(D3D11CmdType::None, viewportCount,
         [] (DxvkContext* ctx, const DxvkViewport* viewports, size_t count) {
@@ -3529,6 +3660,11 @@ namespace dxvk {
         dst->viewport.minDepth = vp.MinDepth;
         dst->viewport.maxDepth = vp.MaxDepth;
 
+        dst->viewport.x *= scaleX;
+        dst->viewport.y *= scaleY;
+        dst->viewport.width *= scaleX;
+        dst->viewport.height *= scaleY;
+
         if (!enableScissorTest) {
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
@@ -3541,6 +3677,12 @@ namespace dxvk {
           dst->scissor.extent = VkExtent2D {
             uint32_t(std::max(sr.left, sr.right) - sr.left),
             uint32_t(std::max(sr.top, sr.bottom) - sr.top) };
+          int32_t right = int32_t(float(dst->scissor.offset.x + dst->scissor.extent.width) * scaleX);
+          int32_t bottom = int32_t(float(dst->scissor.offset.y + dst->scissor.extent.height) * scaleY);
+          dst->scissor.offset.x = int32_t(float(dst->scissor.offset.x) * scaleX);
+          dst->scissor.offset.y = int32_t(float(dst->scissor.offset.y) * scaleY);
+          dst->scissor.extent.width = std::max(0, right - dst->scissor.offset.x);
+          dst->scissor.extent.height = std::max(0, bottom - dst->scissor.offset.y);
         }
       }
     } else {
@@ -3707,6 +3849,8 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::BindFramebuffer() {
+    if (m_parent->GetOptions()->graphics.scalesResolution())
+      ApplyViewportState();
     DxvkDepthBiasRepresentation depthBiasRepresentation =
       { VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT,
         m_device->features().extDepthBiasControl.depthBiasExact };
@@ -3987,6 +4131,13 @@ namespace dxvk {
 
     if (pResource) {
       if (pResource->GetViewInfo().Dimension != D3D11_RESOURCE_DIMENSION_BUFFER) {
+        auto texture = GetCommonTexture(pResource->GetViewInfo().pResource);
+        if (texture->NeedsSamplingResolve() || (texture->GetForcedMipView()
+         && (texture->Desc()->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))
+         && pResource->GetImageView()->info().mipIndex + pResource->GetImageView()->info().mipCount
+              > texture->Desc()->MipLevels))
+          GenerateForcedMipmaps(texture);
+
         EmitCs([
           cSlotId = slotId,
           cStage  = GetShaderStage(ShaderStage),
@@ -4327,7 +4478,70 @@ namespace dxvk {
     bool dstIsImage = pDstTexture->HasImage();
     bool srcIsImage = pSrcTexture->HasImage();
 
-    if (dstIsImage && srcIsImage) {
+    if (pDstTexture->IsScaled() || pSrcTexture->IsScaled()) {
+      VkOffset3D physicalDstOffset = DstOffset;
+      VkOffset3D physicalSrcOffset = SrcOffset;
+      VkExtent3D physicalDstExtent = dstExtent;
+      VkExtent3D physicalSrcExtent = SrcExtent;
+      pDstTexture->ScaleRegion(physicalDstOffset, physicalDstExtent, pDstLayers->mipLevel);
+      pSrcTexture->ScaleRegion(physicalSrcOffset, physicalSrcExtent, pSrcLayers->mipLevel);
+
+      if (dstIsImage && srcIsImage) {
+        EmitCs([cDst = pDstTexture->GetImage(), cSrc = pSrcTexture->GetImage(),
+                cDstLayers = *pDstLayers, cSrcLayers = *pSrcLayers,
+                cDstOffset = physicalDstOffset, cSrcOffset = physicalSrcOffset,
+                cDstExtent = physicalDstExtent, cSrcExtent = physicalSrcExtent] (DxvkContext* ctx) {
+          if (cDst == cSrc && cDstLayers == cSrcLayers && cDstExtent == cSrcExtent) {
+            ctx->copyImageRegion(cDst, cDstLayers, cDstOffset, cSrcOffset, cSrcExtent);
+          } else if (cDstExtent == cSrcExtent && cDst->info().sampleCount == cSrc->info().sampleCount) {
+            ctx->copyImage(cDst, cDstLayers, cDstOffset, cSrc, cSrcLayers, cSrcOffset, cSrcExtent);
+          } else {
+            BlitResolutionImage(ctx, cDst, cSrc, cDstLayers, cDstOffset, cDstExtent,
+              cSrcOffset, cSrcExtent, &cSrcLayers);
+          }
+        });
+      } else {
+        // The staging buffers keep the exact byte layout requested by the app.
+        auto logicalImage = dstIsImage ? pDstTexture->CreateLogicalImage() : pSrcTexture->CreateLogicalImage();
+        for (uint32_t i = 0; i < pDstLayers->layerCount; i++) {
+          uint32_t dstSubresource = D3D11CalcSubresource(pDstLayers->mipLevel, pDstLayers->baseArrayLayer + i, pDstTexture->Desc()->MipLevels);
+          uint32_t srcSubresource = D3D11CalcSubresource(pSrcLayers->mipLevel, pSrcLayers->baseArrayLayer + i, pSrcTexture->Desc()->MipLevels);
+          if (dstIsImage) {
+            auto layers = *pDstLayers;
+            layers.baseArrayLayer += i;
+            layers.layerCount = 1;
+            EmitCs([cDst = pDstTexture->GetImage(), cLogical = logicalImage, cLayers = layers,
+                    cOffset = DstOffset, cExtent = dstExtent,
+                    cPhysicalOffset = physicalDstOffset, cPhysicalExtent = physicalDstExtent,
+                    cFormat = pDstTexture->GetPackedFormat(),
+                    cBuffer = pSrcTexture->GetMappedBuffer(srcSubresource),
+                    cBufferOffset = pSrcTexture->ComputeMappedOffset(srcSubresource, 0, SrcOffset),
+                    cLayout = pSrcTexture->GetSubresourceLayout(pSrcLayers->aspectMask, srcSubresource)] (DxvkContext* ctx) {
+              ctx->copyBufferToImage(cLogical, cLayers, cOffset, cExtent,
+                cBuffer, cBufferOffset, cLayout.RowPitch, cLayout.DepthPitch, cFormat);
+              BlitResolutionImage(ctx, cDst, cLogical, cLayers,
+                cPhysicalOffset, cPhysicalExtent, cOffset, cExtent);
+            });
+          } else {
+            auto layers = *pSrcLayers;
+            layers.baseArrayLayer += i;
+            layers.layerCount = 1;
+            EmitCs([cSrc = pSrcTexture->GetImage(), cLogical = logicalImage, cLayers = layers,
+                    cOffset = SrcOffset, cExtent = SrcExtent,
+                    cPhysicalOffset = physicalSrcOffset, cPhysicalExtent = physicalSrcExtent,
+                    cFormat = pSrcTexture->GetPackedFormat(),
+                    cBuffer = pDstTexture->GetMappedBuffer(dstSubresource),
+                    cBufferOffset = pDstTexture->ComputeMappedOffset(dstSubresource, 0, DstOffset),
+                    cLayout = pDstTexture->GetSubresourceLayout(pDstLayers->aspectMask, dstSubresource)] (DxvkContext* ctx) {
+              BlitResolutionImage(ctx, cLogical, cSrc, cLayers,
+                cOffset, cExtent, cPhysicalOffset, cPhysicalExtent);
+              ctx->copyImageToBuffer(cBuffer, cBufferOffset, cLayout.RowPitch, cLayout.DepthPitch,
+                cFormat, cLogical, cLayers, cOffset, cExtent);
+            });
+          }
+        }
+      }
+    } else if (dstIsImage && srcIsImage) {
       EmitCs([
         cDstImage  = pDstTexture->GetImage(),
         cSrcImage  = pSrcTexture->GetImage(),
@@ -4464,6 +4678,8 @@ namespace dxvk {
         }
       }
     }
+
+    GenerateForcedMipmaps(pDstTexture);
 
     if (pDstTexture->HasSequenceNumber()) {
       for (uint32_t i = 0; i < pDstLayers->layerCount; i++) {
@@ -5716,8 +5932,16 @@ namespace dxvk {
       pDstSubresource->arrayLayer, pDstTexture->Desc()->MipLevels);
 
     if (dstIsImage) {
+      auto image = pDstTexture->GetImage();
+      auto uploadImage = pDstTexture->IsScaled() ? pDstTexture->CreateLogicalImage() : image;
+      auto physicalOffset = DstOffset;
+      auto physicalExtent = DstExtent;
+      pDstTexture->ScaleRegion(physicalOffset, physicalExtent, pDstSubresource->mipLevel);
       EmitCs([
-        cDstImage         = pDstTexture->GetImage(),
+        cDstImage         = uploadImage,
+        cRenderImage      = image,
+        cRenderOffset     = physicalOffset,
+        cRenderExtent     = physicalExtent,
         cDstLayers        = vk::makeSubresourceLayers(*pDstSubresource),
         cDstOffset        = DstOffset,
         cDstExtent        = DstExtent,
@@ -5729,6 +5953,9 @@ namespace dxvk {
           cStagingSlice.buffer(),
           cStagingSlice.offset(), 0, 0,
           cPackedFormat);
+        if (cRenderImage != cDstImage)
+          BlitResolutionImage(ctx, cRenderImage, cDstImage, cDstLayers,
+            cRenderOffset, cRenderExtent, cDstOffset, cDstExtent);
       });
     } else {
       // If the destination image is backed only by a buffer, we need to use
@@ -5783,6 +6010,8 @@ namespace dxvk {
         srcPlaneOffset += util::flattenImageExtent(blockCount) * elementSize;
       }
     }
+
+    GenerateForcedMipmaps(pDstTexture);
 
     if (pDstTexture->HasSequenceNumber())
       GetTypedContext()->TrackTextureSequenceNumber(pDstTexture, dstSubresource);
@@ -5900,8 +6129,15 @@ namespace dxvk {
             return false;
 
           if (curView->image()->info().sampleCount
-           != refView->image()->info().sampleCount)
+           != refView->image()->info().sampleCount) {
+            if (m_parent->GetOptions()->graphics.msaa > 0) {
+              static std::atomic<bool> warned = false;
+              if (!warned.exchange(true))
+                Logger::warn("D7VK: Forced MSAA cannot combine incompatible sample counts on "
+                  "attachments in this pass; use application-driven MSAA for this application");
+            }
             return false;
+          }
 
           // Color targets must all be the same size
           VkExtent3D curExtent = curView->mipLevelExtent(0);

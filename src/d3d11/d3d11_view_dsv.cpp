@@ -18,10 +18,13 @@ namespace dxvk {
     D3D11_COMMON_RESOURCE_DESC resourceDesc;
     GetCommonResourceDesc(pResource, &resourceDesc);
 
+    auto formatInfo = pDevice->LookupFormat(pDesc->Format, DXGI_VK_FORMAT_MODE_DEPTH);
     DxvkImageViewKey viewInfo;
-    viewInfo.format = pDevice->LookupFormat(pDesc->Format, DXGI_VK_FORMAT_MODE_DEPTH).Format;
+    viewInfo.format = formatInfo.Format;
     viewInfo.layout = GetViewLayout();
-    viewInfo.aspects = lookupFormatInfo(viewInfo.format)->aspectMask;
+    // A depth-precision override may back D16 with D24S8. Keep the
+    // application's depth-only view from enabling an extra stencil plane.
+    viewInfo.aspects = formatInfo.Aspect;
     viewInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     
     switch (pDesc->ViewDimension) {
