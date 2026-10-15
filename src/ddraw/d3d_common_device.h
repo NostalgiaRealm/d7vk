@@ -113,12 +113,7 @@ namespace dxvk {
       }
     }
 
-    const RECT* GetPresentRect() const {
-      if (!m_aspectRatioCorrection)
-        return nullptr;
-
-      return &m_presentRect;
-    }
+    const RECT* GetPresentRect() const;
 
     D3DMATERIALHANDLE GetCurrentMaterialHandle() const {
       return m_materialHandle;

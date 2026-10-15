@@ -833,6 +833,8 @@ namespace dxvk {
 
     void ApplyDirtyComputeBindings();
 
+    void GenerateForcedMipmaps(D3D11CommonTexture* texture);
+
     void ApplyInputLayout();
     
     void ApplyPrimitiveTopology();

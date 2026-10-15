@@ -3,6 +3,7 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+#include "../dxvk/dxvk_resolution.h"
 
 namespace dxvk {
 
@@ -49,6 +50,18 @@ namespace dxvk {
       InitHostVisibleTexture(pTexture, pInitialData);
     else
       InitDeviceLocalTexture(pTexture, pInitialData);
+
+    if (pTexture->GetForcedMipView() || pTexture->NeedsSamplingResolve()) {
+      EmitCs(0u, [
+        cRender = pTexture->GetImage(),
+        cSampled = pTexture->GetSampledImage(),
+        cView = pTexture->GetForcedMipView(),
+        cFilter = m_parent->GetOptions()->graphics.mipmapping == GraphicsMipmaps::Point
+          ? VK_FILTER_NEAREST : VK_FILTER_LINEAR
+      ] (DxvkContext* ctx) {
+        UpdateD3D11SampledImage(ctx, cRender, cSampled, cView, cFilter);
+      });
+    }
 
     SyncSharedTexture(pTexture);
   }
@@ -167,6 +180,9 @@ namespace dxvk {
     auto formatInfo = lookupFormatInfo(packedFormat);
 
     if (pInitialData && pInitialData->pSysMem) {
+      auto renderImage = image;
+      if (pTexture->IsScaled())
+        image = pTexture->CreateLogicalImage();
       // Compute data size for all subresources and allocate staging buffer memory
       DxvkBufferSlice stagingSlice;
 
@@ -213,8 +229,14 @@ namespace dxvk {
       if (pTexture->HasImage()) {
         auto stagingSize = stagingSlice.length();
 
+        // The allocation includes private generated levels. Clear their
+        // padding before upload; mip generation fills them immediately after.
+        if (pTexture->GetForcedMipView())
+          std::memset(stagingSlice.mapPtr(dataOffset), 0, stagingSize - dataOffset);
+
         EmitCs(stagingSize, [
           cImage        = std::move(image),
+          cRenderImage  = std::move(renderImage),
           cStagingSlice = std::move(stagingSlice),
           cFormat       = packedFormat
         ] (DxvkContext* ctx) {
@@ -222,6 +244,15 @@ namespace dxvk {
             cStagingSlice.buffer(),
             cStagingSlice.offset(),
             CACHE_LINE_SIZE, cFormat);
+          if (cImage != cRenderImage) {
+            for (uint32_t mip = 0; mip < cImage->info().mipLevels; mip++) {
+              VkImageSubresourceLayers layers = { cImage->formatInfo()->aspectMask,
+                mip, 0, cImage->info().numLayers };
+              BlitResolutionImage(ctx, cRenderImage, cImage, layers,
+                {0, 0, 0}, cRenderImage->mipLevelExtent(mip),
+                {0, 0, 0}, cImage->mipLevelExtent(mip));
+            }
+          }
         });
       }
     } else {

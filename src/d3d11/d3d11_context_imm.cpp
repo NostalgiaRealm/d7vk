@@ -659,6 +659,9 @@ namespace dxvk {
     // Unmap the subresource. This will implicitly destroy the
     // staging buffer for dynamically mapped images.
     pResource->NotifyUnmap(Subresource);
+
+    if (mapType != uint32_t(D3D11_MAP_READ))
+      GenerateForcedMipmaps(pResource);
   }
   
   

@@ -176,8 +176,14 @@ namespace dxvk {
       m_info.Image.NumLevels = viewInfo.mipCount;
       m_info.Image.NumLayers = viewInfo.layerCount;
 
+      // Views that include the application's smallest mip may sample the
+      // generated tail. GetDesc and hazard tracking retain the original view.
+      if (texture->GetForcedMipView()
+       && viewInfo.mipIndex + viewInfo.mipCount == texture->Desc()->MipLevels)
+        viewInfo.mipCount = texture->GetSampledImage()->info().mipLevels - viewInfo.mipIndex;
+
       // Create the underlying image view object
-      m_imageView = texture->GetImage()->createView(viewInfo);
+      m_imageView = texture->GetSampledImage()->createView(viewInfo);
     }
   }
   

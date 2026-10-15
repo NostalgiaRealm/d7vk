@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../util/config/config.h"
+#include "../util/config/graphics_options.h"
 #include "../dxvk/dxvk_device.h"
 
 namespace dxvk {
@@ -12,6 +13,7 @@ namespace dxvk {
   };
 
   struct D3D9Options {
+    GraphicsOptions graphics;
 
     D3D9Options(const Rc<DxvkDevice>& device, const Config& config);
 

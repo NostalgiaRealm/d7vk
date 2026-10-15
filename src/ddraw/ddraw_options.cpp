@@ -3,6 +3,7 @@
 namespace dxvk {
 
   D3DOptions::D3DOptions(const Config& config) {
+    graphics = GraphicsOptions(config);
     this->glideCompatibilityMode  = config.getOption<bool>("ddraw.glideCompatibilityMode",  false);
     this->forceMultiThreaded      = config.getOption<bool>("ddraw.forceMultiThreaded",      false);
     this->forceSWVP               = config.getOption<bool>("ddraw.forceSWVP",               false);
@@ -21,7 +22,9 @@ namespace dxvk {
     this->forceLegacyBuffers      = config.getOption<bool>("ddraw.forceLegacyBuffers",      false);
     this->cpuProcessVertices      = config.getOption<bool>("ddraw.cpuProcessVertices",       true);
     this->ignoreDisplayModes      = config.getOption<bool>("ddraw.ignoreDisplayModes",      false);
-    this->backBufferResize        = config.getOption<bool>("ddraw.backBufferResize",        false);
+    // A forced render size needs the app's SetDisplayMode dimensions, not the
+    // desktop-sized DirectDraw primary returned by some Wine window systems.
+    this->backBufferResize        = config.getOption<bool>("ddraw.backBufferResize",        graphics.scalesResolution());
     this->preserveAspectRatio     = config.getOption<bool>("ddraw.preserveAspectRatio",      true);
     this->forceLegacyPresent      = config.getOption<bool>("ddraw.forceLegacyPresent",      false);
     this->systemMemoryShadow      = config.getOption<bool>("ddraw.systemMemoryShadow",       true);
@@ -67,6 +70,9 @@ namespace dxvk {
     } else {
       this->emulateFSAA = FSAAEmulation::Disabled;
     }
+    // The common quality setting takes precedence over the legacy FSAA hint.
+    if (graphics.msaa >= 0)
+      this->emulateFSAA = graphics.msaa ? FSAAEmulation::Forced : FSAAEmulation::Disabled;
   };
 
 }

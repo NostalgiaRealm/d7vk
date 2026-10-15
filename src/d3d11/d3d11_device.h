@@ -459,6 +459,26 @@ namespace dxvk {
       return &m_d3d11Options;
     }
 
+    void SetRenderResolution(UINT width, UINT height) {
+      m_logicalRenderExtent = { std::max(width, 1u), std::max(height, 1u) };
+    }
+
+    VkExtent3D GetRenderExtent(VkExtent3D logical) const {
+      const auto& graphics = m_d3d11Options.graphics;
+      if (!GraphicsOptions::screenRelative(logical.width, logical.height,
+          m_logicalRenderExtent.width, m_logicalRenderExtent.height))
+        return logical;
+      uint64_t width = graphics.width
+        ? uint64_t(logical.width) * graphics.width / m_logicalRenderExtent.width
+        : uint64_t(logical.width) * graphics.resolutionScale;
+      uint64_t height = graphics.height
+        ? uint64_t(logical.height) * graphics.height / m_logicalRenderExtent.height
+        : uint64_t(logical.height) * graphics.resolutionScale;
+      uint32_t limit = m_dxvkDevice->properties().core.properties.limits.maxImageDimension2D;
+      return { uint32_t(std::clamp<uint64_t>(width, 1, limit)),
+               uint32_t(std::clamp<uint64_t>(height, 1, limit)), logical.depth };
+    }
+
     D3D10Device* GetD3D10Interface() const {
       return m_d3d10Device;
     }
@@ -500,8 +520,9 @@ namespace dxvk {
     const Rc<DxvkDevice>            m_dxvkDevice;
     const Rc<DxvkAdapter>           m_dxvkAdapter;
     
-    const DXGIVkFormatTable         m_d3d11Formats;
     const D3D11Options              m_d3d11Options;
+    VkExtent2D                     m_logicalRenderExtent = { 0, 0 };
+    const DXGIVkFormatTable         m_d3d11Formats;
 
     DxvkShaderOptions               m_shaderOptions = { };
 

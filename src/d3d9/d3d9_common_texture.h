@@ -151,6 +151,41 @@ namespace dxvk {
       return m_resolveImage;
     }
 
+    bool HasSampleResolve() const {
+      return m_type == D3DRTYPE_TEXTURE && m_image
+        && m_image->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
+    }
+
+    bool NeedsSampleResolve() const {
+      return m_sampleResolveDirty && HasSampleResolve();
+    }
+
+    void MarkSampleResolveDirty() { m_sampleResolveDirty = true; }
+    void MarkSampleResolved() { m_sampleResolveDirty = false; }
+
+    bool IsScaled() const {
+      return m_image && m_image->info().extent != GetExtent();
+    }
+
+    VkOffset3D ScaleOffset(VkOffset3D offset, uint32_t mip = 0) const {
+      if (!IsScaled()) return offset;
+      auto logical = GetExtentMip(mip);
+      auto physical = m_image->mipLevelExtent(mip);
+      offset.x = int64_t(offset.x) * physical.width / logical.width;
+      offset.y = int64_t(offset.y) * physical.height / logical.height;
+      return offset;
+    }
+
+    void ScaleRegion(VkOffset3D& offset, VkExtent3D& extent, uint32_t mip = 0) const {
+      auto end = ScaleOffset({ offset.x + int32_t(extent.width), offset.y + int32_t(extent.height), 1 }, mip);
+      offset = ScaleOffset(offset, mip);
+      extent.width = std::max(0, end.x - offset.x);
+      extent.height = std::max(0, end.y - offset.y);
+    }
+
+    // Single-sample image at the application's logical dimensions for CPU transfers.
+    const Rc<DxvkImage>& GetMappingImage();
+
     /**
      * \brief Returns a pointer to the internal data used for LockRect/LockBox
      *
@@ -253,6 +288,10 @@ namespace dxvk {
       return m_upgradedToD32f;
     }
 
+    // CPU pitches and uploads follow the application format even when the
+    // backing depth image uses a higher precision Vulkan format.
+    const DxvkFormatInfo* GetPackedFormatInfo() const;
+
     /**
      * \brief FETCH4 compatibility
      * \returns Whether the format of the texture supports the FETCH4 hack
@@ -323,8 +362,15 @@ namespace dxvk {
      * \returns Whether the texture is to have automatic mip generation
      */
     bool IsAutomaticMip() const {
-      return m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP;
+      return (m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP) || m_forcedMipMaps;
     }
+
+    // Generate only the missing tail, never replace application-supplied mips.
+    UINT MipGenerationSourceLevel() const {
+      return m_forcedMipMaps ? m_exposedMipLevels - 1 : 0;
+    }
+
+    bool HasForcedMipMaps() const { return m_forcedMipMaps; }
 
     /**
      * \brief Checks whether sRGB views can be created
@@ -382,13 +428,19 @@ namespace dxvk {
 
     bool IsAnySubresourceLocked() const { return m_locked.any(); }
 
-    void SetNeedsReadback(UINT Subresource, bool value) { m_needsReadback.set(Subresource, value); }
+    void SetNeedsReadback(UINT Subresource, bool value) {
+      m_needsReadback.set(Subresource, value);
+      if (value) MarkSampleResolveDirty();
+    }
 
     bool NeedsReadback(UINT Subresource) const { return m_needsReadback.get(Subresource); }
 
     bool NeedsAnyReadback() const { return m_needsReadback.any(); }
 
-    void MarkAllNeedReadback() { m_needsReadback.setAll(); }
+    void MarkAllNeedReadback() {
+      m_needsReadback.setAll();
+      MarkSampleResolveDirty();
+    }
 
     const Rc<DxvkImageView>& GetSampleView(bool srgb) const {
       return m_sampleView.Pick(srgb && IsSrgbCompatible());
@@ -529,6 +581,7 @@ namespace dxvk {
 
     Rc<DxvkImage>                 m_image;
     Rc<DxvkImage>                 m_resolveImage;
+    bool                         m_sampleResolveDirty = true;
     Rc<DxvkBuffer>                m_buffer;
     MemoryFileRegion              m_data = { };
 
@@ -560,6 +613,8 @@ namespace dxvk {
 
     DWORD                         m_exposedMipLevels = 0;
 
+    bool                          m_forcedMipMaps = false;
+
     bool                          m_needsMipGen = false;
 
     D3DTEXTUREFILTERTYPE          m_mipFilter = D3DTEXF_LINEAR;
@@ -571,6 +626,8 @@ namespace dxvk {
     Rc<DxvkImage> CreatePrimaryImage(D3DRESOURCETYPE ResourceType, HANDLE* pSharedHandle) const;
 
     Rc<DxvkImage> CreateResolveImage() const;
+
+    Rc<DxvkImage> m_mappingImage;
 
     BOOL DetermineShadowState() const;
 

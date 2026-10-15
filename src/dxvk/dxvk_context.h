@@ -32,6 +32,11 @@ namespace dxvk {
     DxvkContext(const Rc<DxvkDevice>& device);
     ~DxvkContext();
 
+    void blitResolutionImage(
+      const Rc<DxvkImage>& dstImage, const Rc<DxvkImage>& srcImage,
+      VkImageSubresourceLayers dstLayers, VkOffset3D dstOffset, VkExtent3D dstExtent,
+      VkImageSubresourceLayers srcLayers, VkOffset3D srcOffset, VkExtent3D srcExtent);
+
     /**
      * \brief Begins command buffer recording
      * 
@@ -1380,6 +1385,12 @@ namespace dxvk {
     DxvkDescriptorCopyWorker m_descriptorWorker;
 
     DxvkImplicitResolveTracker  m_implicitResolves;
+
+    Rc<DxvkImage> resolveImageForCopy(
+      const Rc<DxvkImage>& image,
+            VkImageSubresourceLayers subresource,
+            VkOffset3D offset,
+            VkExtent3D extent);
 
     void blitImageFb(
             Rc<DxvkImageView>     dstView,

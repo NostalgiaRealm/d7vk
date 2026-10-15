@@ -310,7 +310,7 @@ namespace dxvk {
     DxvkMetaImageCopyPushArgs pushArgs = loadImageCopyPushArgs(builder, helper);
 
     return createCopyToImageVs(builder, helper, vertex, key.srcViewType,
-      key.samples, pushArgs.srcOffset, pushArgs.srcExtent, pushArgs.layerIndex);
+      key.srcSamples, pushArgs.srcOffset, pushArgs.srcExtent, pushArgs.layerIndex);
   }
 
 
@@ -357,19 +357,19 @@ namespace dxvk {
 
     DxvkMetaImageCopyPushArgs pushArgs = loadImageCopyPushArgs(builder, helper);
 
-    ir::ResourceKind kind = helper.determineResourceKind(key.srcViewType, key.samples);
+    ir::ResourceKind kind = helper.determineResourceKind(key.srcViewType, key.srcSamples);
 
     ir::SsaDef srv0;
     ir::SsaDef srv1;
 
     if (key.dstAspects != VK_IMAGE_ASPECT_STENCIL_BIT) {
       VkImageAspectFlagBits aspect0 = VkImageAspectFlagBits(key.dstAspects & ~VK_IMAGE_ASPECT_STENCIL_BIT);
-      srv0 = helper.declareImageSrv(builder, 0u, "src", key.srcViewType, key.dstFormat, aspect0, key.samples);
+      srv0 = helper.declareImageSrv(builder, 0u, "src", key.srcViewType, key.dstFormat, aspect0, key.srcSamples);
     }
 
     if (key.dstAspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
       srv1 = helper.declareImageSrv(builder, 1u, "src_stencil", key.srcViewType,
-        key.dstFormat, VK_IMAGE_ASPECT_STENCIL_BIT, key.samples);
+        key.dstFormat, VK_IMAGE_ASPECT_STENCIL_BIT, key.srcSamples);
     }
 
     // Load coordinate, layer and, if necessary, sample ID as integers
@@ -1066,6 +1066,9 @@ namespace dxvk {
 
     if (key.samples > VK_SAMPLE_COUNT_1_BIT)
       name << "_msx" << uint32_t(key.samples);
+
+    if (key.srcSamples != key.samples)
+      name << "_src_msx" << uint32_t(key.srcSamples);
 
     return str::tolower(name.str());
   }

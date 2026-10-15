@@ -193,6 +193,10 @@ namespace dxvk {
 
     if (shaderStage) {
       viewInfo.aspects &= ~VK_IMAGE_ASPECT_STENCIL_BIT;
+      // Stencil-only copies/resolves still need a valid descriptor in slot 0,
+      // even though only the separately bound stencil descriptor is read.
+      if (!viewInfo.aspects)
+        viewInfo.aspects = VK_IMAGE_ASPECT_STENCIL_BIT;
       viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
     }
 

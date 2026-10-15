@@ -2,10 +2,8 @@
 
 set -e
 
-shopt -s extglob
-
 if [ -z "$1" ] || [ -z "$2" ]; then
-  echo "Usage: $0 version destdir [--no-package] [--dev-build]"
+  echo "Usage: $0 version destdir [--no-package] [--dev-build] [--32-only|--64-only] [--llvm] [--build-arm64x|--arm64x-only]"
   exit 1
 fi
 
@@ -26,7 +24,7 @@ opt_nopackage=0
 opt_devbuild=0
 opt_buildid=false
 opt_64_only=0
-opt_32_only=1
+opt_32_only=0
 opt_arm64x_only=0
 opt_build_arm64x=0
 
@@ -46,9 +44,14 @@ while [ $# -gt 0 ]; do
     ;;
   "--64-only")
     opt_64_only=1
+    opt_32_only=0
     ;;
   "--32-only")
     opt_32_only=1
+    opt_64_only=0
+    ;;
+  "--llvm")
+    crossfile="build-llvm-"
     ;;
   "--arm64x-only")
     opt_arm64x_only=1
@@ -64,7 +67,7 @@ while [ $# -gt 0 ]; do
 done
 
 function build_arch {
-  export WINEARCH="win$1"
+  export WINEARCH="$1"
   export WINEPREFIX="$DXVK_BUILD_DIR/wine.$1"
   
   cd "$DXVK_SRC_DIR"
@@ -82,30 +85,28 @@ function build_arch {
         --libdir "$2"                                      \
         -Db_ndebug=if-release                               \
         -Dbuild_id=$opt_buildid                             \
-        -Denable_dxgi=false                                 \
-        -Denable_d3d8=false                                 \
-        -Denable_d3d10=false                                \
-        -Denable_d3d11=false                                \
         "$DXVK_BUILD_DIR/build.$1"
 
   cd "$DXVK_BUILD_DIR/build.$1"
   meson install --skip-subprojects
 
   if [ $opt_devbuild -eq 0 ]; then
-    # get rid of some useless .a files
-    rm "$DXVK_BUILD_DIR/$2/"*.!(dll)
+    # Keep only distributable DLLs, not import libraries or debug files.
+    for artifact in "$DXVK_BUILD_DIR/$2/"*; do
+      case "$artifact" in *.dll) ;; *) rm -f "$artifact" ;; esac
+    done
     rm -R "$DXVK_BUILD_DIR/build.$1"
   fi
 }
 
 function package {
   cd "$DXVK_BUILD_DIR/.."
-  tar -czf "$DXVK_ARCHIVE_PATH" "dxvk-$DXVK_VERSION"
-  rm -R "dxvk-$DXVK_VERSION"
+  tar -czf "$DXVK_ARCHIVE_PATH" "d7vk-$DXVK_VERSION"
+  rm -R "d7vk-$DXVK_VERSION"
 }
 
 if [ $opt_32_only -eq 0 -a $opt_arm64x_only -eq 0 ]; then
-  build_arch win64 x86
+  build_arch win64 x64
 fi
 if [ $opt_64_only -eq 0 -a $opt_arm64x_only -eq 0 ]; then
   build_arch win32 x32
@@ -113,6 +114,9 @@ fi
 if [ $opt_build_arm64x -eq 1 -o $opt_arm64x_only -eq 1 ]; then
   build_arch arm64x arm64x
 fi
+
+cp "$DXVK_SRC_DIR/dxvk.conf" "$DXVK_SRC_DIR/README.md" "$DXVK_SRC_DIR/VALIDATION.md" "$DXVK_SRC_DIR/LICENSE" "$DXVK_BUILD_DIR/"
+cp -R "$DXVK_SRC_DIR/presets" "$DXVK_BUILD_DIR/"
 
 if [ $opt_nopackage -eq 0 ]; then
   package

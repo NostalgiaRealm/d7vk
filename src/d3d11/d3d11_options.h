@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../util/config/config.h"
+#include "../util/config/graphics_options.h"
 
 #include "../dxgi/dxgi_options.h"
 
@@ -11,6 +12,7 @@
 namespace dxvk {
 
   struct D3D11Options {
+    GraphicsOptions graphics;
     D3D11Options(const Config& config);
 
     /// Force thread-group shared memory accesses to be volatile

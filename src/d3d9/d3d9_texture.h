@@ -61,7 +61,9 @@ namespace dxvk {
       DWORD oldLod = m_lod;
 
       if (likely(m_texture.GetPool() == D3DPOOL_MANAGED)) {
-        m_lod = std::min<DWORD>(LODNew, m_texture.Desc()->MipLevels - 1);
+        const DWORD levelCount = m_texture.HasForcedMipMaps()
+          ? m_texture.ExposedMipLevels() : m_texture.Desc()->MipLevels;
+        m_lod = std::min<DWORD>(LODNew, levelCount - 1);
 
         if (m_lod != oldLod) {
           m_texture.CreateSampleView(m_lod);

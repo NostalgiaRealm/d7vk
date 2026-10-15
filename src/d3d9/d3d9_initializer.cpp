@@ -120,7 +120,7 @@ namespace dxvk {
     if (pInitialData) {
       // Initial data is only supported for textures with 1 subresource
       VkExtent3D mipExtent = pTexture->GetExtentMip(0);
-      const DxvkFormatInfo* formatInfo = lookupFormatInfo(pTexture->GetFormatMapping().Format);
+      const DxvkFormatInfo* formatInfo = pTexture->GetPackedFormatInfo();
       VkExtent3D blockCount = util::computeBlockCount(mipExtent, formatInfo->blockSize);
       uint32_t pitch = blockCount.width * formatInfo->elementSize;
       uint32_t alignedPitch = align(pitch, 4);

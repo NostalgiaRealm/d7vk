@@ -34,12 +34,14 @@ namespace dxvk {
       uint32_t sampler = 0u;
       uint32_t layerIndex = 0u;
       uint32_t layerCount = 0u;
+      uint32_t stencilBit = 0u;
     };
 
     /** Look-up info for blit pipeline */
     struct Key {
       VkImageViewType         srcViewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
       VkFormat                dstFormat   = VK_FORMAT_UNDEFINED;
+      VkImageAspectFlags      dstAspect   = 0u;
       VkSampleCountFlagBits   dstSamples  = VK_SAMPLE_COUNT_1_BIT;
       VkSampleCountFlagBits   srcSamples  = VK_SAMPLE_COUNT_1_BIT;
       DxvkMetaBlitResolveMode resolveMode = DxvkMetaBlitResolveMode::FilterNearest;
@@ -47,6 +49,7 @@ namespace dxvk {
       bool eq(const Key& other) const {
         return srcViewType  == other.srcViewType
             && dstFormat    == other.dstFormat
+            && dstAspect    == other.dstAspect
             && dstSamples   == other.dstSamples
             && srcSamples   == other.srcSamples
             && resolveMode  == other.resolveMode;
@@ -56,6 +59,7 @@ namespace dxvk {
         DxvkHashState hash;
         hash.add(uint32_t(srcViewType));
         hash.add(uint32_t(dstFormat));
+        hash.add(uint32_t(dstAspect));
         hash.add(uint32_t(dstSamples));
         hash.add(uint32_t(srcSamples));
         hash.add(uint32_t(resolveMode));

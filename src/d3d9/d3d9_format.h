@@ -237,6 +237,7 @@ namespace dxvk {
 
     bool m_d24s8Support;
     bool m_d16s8Support;
+    uint32_t m_depthBits;
 
     bool m_dfSupport;
     bool m_x4r4g4b4Support;

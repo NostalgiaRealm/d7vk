@@ -36,6 +36,7 @@ namespace dxvk {
       VkFormat dstFormat = VK_FORMAT_UNDEFINED;
       VkImageAspectFlags dstAspects = 0u;
       VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+      VkSampleCountFlagBits srcSamples = VK_SAMPLE_COUNT_1_BIT;
       VkBool32 bitwiseStencil = VK_FALSE;
 
       bool eq(const Key& other) const {
@@ -43,6 +44,7 @@ namespace dxvk {
             && dstFormat      == other.dstFormat
             && dstAspects     == other.dstAspects
             && samples        == other.samples
+            && srcSamples     == other.srcSamples
             && bitwiseStencil == other.bitwiseStencil;
       }
 
@@ -52,6 +54,7 @@ namespace dxvk {
         hash.add(uint32_t(dstFormat));
         hash.add(uint32_t(dstAspects));
         hash.add(uint32_t(samples));
+        hash.add(uint32_t(srcSamples));
         hash.add(uint32_t(bitwiseStencil));
         return hash;
       }

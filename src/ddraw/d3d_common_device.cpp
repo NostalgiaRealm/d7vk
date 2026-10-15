@@ -62,6 +62,18 @@ namespace dxvk {
     return nullptr;
   }
 
+  const RECT* D3DCommonDevice::GetPresentRect() const {
+    // This rectangle fits a resized back buffer into the native fullscreen
+    // primary surface. A forced window uses the logical back-buffer size as
+    // its client area, so Present must fit that client instead of retaining
+    // the desktop-sized destination and clipping the image.
+    if (!m_aspectRatioCorrection
+     || m_commonIntf->GetOptions()->graphics.windowMode != GraphicsWindow::App)
+      return nullptr;
+
+    return &m_presentRect;
+  }
+
   DDrawSurface* D3DCommonDevice::GetCurrentRenderTarget() const {
     return m_device5 != nullptr ? m_device5->GetRenderTarget() :
            m_device3 != nullptr ? m_device3->GetRenderTarget() : nullptr;

@@ -16,6 +16,10 @@ namespace dxvk {
   
   class D3D11Device;
   class D3D11GDISurface;
+
+  void UpdateD3D11SampledImage(DxvkContext* ctx,
+    const Rc<DxvkImage>& renderImage, const Rc<DxvkImage>& sampledImage,
+    const Rc<DxvkImageView>& mipView, VkFilter mipFilter);
   
   /**
    * \brief Image memory mapping mode
@@ -249,6 +253,34 @@ namespace dxvk {
     Rc<DxvkImage> GetImage() const {
       return m_image;
     }
+
+    bool IsScaled() const {
+      return m_image && m_image->info().extent != MipLevelExtent(0);
+    }
+
+    void ScaleRegion(VkOffset3D& offset, VkExtent3D& extent, uint32_t mip = 0) const {
+      if (!IsScaled()) return;
+      auto logical = MipLevelExtent(mip);
+      auto physical = m_image->mipLevelExtent(mip);
+      int32_t right = int64_t(offset.x + int32_t(extent.width)) * physical.width / logical.width;
+      int32_t bottom = int64_t(offset.y + int32_t(extent.height)) * physical.height / logical.height;
+      offset.x = int64_t(offset.x) * physical.width / logical.width;
+      offset.y = int64_t(offset.y) * physical.height / logical.height;
+      extent.width = std::max(0, right - offset.x);
+      extent.height = std::max(0, bottom - offset.y);
+    }
+
+    Rc<DxvkImage> CreateLogicalImage() const;
+
+    const Rc<DxvkImageView>& GetForcedMipView() const {
+      return m_forcedMipView;
+    }
+
+    Rc<DxvkImage> GetSampledImage() const {
+      return m_sampledImage ? m_sampledImage : m_image;
+    }
+
+    bool NeedsSamplingResolve() const { return m_sampledImage != nullptr; }
     
     /**
      * \brief Mapped subresource buffer
@@ -583,6 +615,8 @@ namespace dxvk {
     VkFormat                      m_packedFormat;
     
     Rc<DxvkImage>                 m_image;
+    Rc<DxvkImage>                 m_sampledImage;
+    Rc<DxvkImageView>             m_forcedMipView;
     small_vector<MappedBuffer, 6> m_buffers;
     small_vector<MappedInfo, 6>   m_mapInfo;
 

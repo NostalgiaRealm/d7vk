@@ -503,7 +503,8 @@ namespace dxvk {
 
     // AMD do not support 24-bit depth buffers on Vulkan,
     // so we have to fall back to a 32-bit depth format.
-    m_d24s8Support = !options.useD32forD24 &&
+    m_depthBits = options.graphics.depthBits;
+    m_d24s8Support = !options.useD32forD24 && m_depthBits != 32 &&
                      CheckImageFormatSupport(adapter, VK_FORMAT_D24_UNORM_S8_UINT,
       VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT);
@@ -521,6 +522,10 @@ namespace dxvk {
 
     if (!m_d24s8Support)
       Logger::info("D3D9: VK_FORMAT_D24_UNORM_S8_UINT -> VK_FORMAT_D32_SFLOAT_S8_UINT");
+
+    if (m_depthBits)
+      Logger::info(str::format("D7VK: Internal depth precision override: ", m_depthBits,
+        " bits; D16 -> ", m_d24s8Support ? "D24_UNORM_S8_UINT" : "D32_SFLOAT"));
 
     if (!m_d16s8Support) {
       if (m_d24s8Support)
@@ -557,6 +562,12 @@ namespace dxvk {
 
     if (Format == D3D9Format::D24FS8 && !m_d24fs8Support)
       return D3D9_VK_FORMAT_MAPPING();
+
+    if (m_depthBits && mapping.Format == VK_FORMAT_D16_UNORM)
+      mapping.Format = m_d24s8Support ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT;
+
+    if (m_depthBits && mapping.Format == VK_FORMAT_D16_UNORM_S8_UINT)
+      mapping.Format = m_d24s8Support ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
 
     if (!m_d24s8Support && mapping.Format == VK_FORMAT_D24_UNORM_S8_UINT)
       mapping.Format = (mapping.Aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
