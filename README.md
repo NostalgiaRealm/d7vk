@@ -6,6 +6,8 @@ A Vulkan-based translation layer for Direct3D 7, 6, 5 and 3, which allows runnin
 
 This fork of [WinterSnowfall/d7vk](https://github.com/WinterSnowfall/d7vk) adds opt-in graphics overrides to the legacy renderer and the bundled D3D8/9/10/11 wrappers. It retains the upstream Git history and licence. No dgVoodoo code or binaries are included. `XP` is the fork's name; the Vulkan and operating-system requirements remain those of upstream D7VK/DXVK.
 
+The current release, **XP 0.2**, is based on upstream D7VK v2.5. Fork-specific changes per release are listed in [CHANGELOG-XP.md](CHANGELOG-XP.md).
+
 Place the settings below in `dxvk.conf` next to the game's executable. An alternate file can be selected with `DXVK_CONFIG_FILE`. Settings also work inside DXVK's per-executable sections, such as `[kao.exe]`. With no overrides configured, application state and upstream compatibility profiles remain in effect. Explicit `d7vk.*` settings take precedence over the corresponding older sampler, MSAA and presentation settings.
 
 | Setting | Values (first is default) |
@@ -37,9 +39,9 @@ Present timing is opt-in (`dxvk.enablePresentTiming = True`), matching the confi
 Clone with `--recurse-submodules` (or run `git submodule update --init --recursive`). The usual Meson, Ninja, glslang and MinGW requirements apply. The package script now builds all bundled wrappers for both architectures and includes the configuration and preset:
 
 ```sh
-./package-release.sh xp-0.1 ./dist
+./package-release.sh xp-0.2 ./dist
 # With LLVM-MinGW's bin directory on PATH:
-./package-release.sh xp-0.1 ./dist --llvm
+./package-release.sh xp-0.2 ./dist --llvm
 ```
 
 For an incremental build, use `meson setup build-x86 --cross-file build-llvm-win32.txt --buildtype release -Denable_tests=true`, then `ninja -C build-x86`. Unit tests are built as `build-x86/tests/graphics-options-test.exe` and can be run with Wine. Use `build-llvm-win64.txt` for 64-bit builds. Only Kao is used for game validation; other titles/APIs still require manual compatibility testing. See [VALIDATION.md](VALIDATION.md) for the tested configurations and remaining limits.

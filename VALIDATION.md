@@ -2,7 +2,39 @@
 
 Validation is limited to **Kao the Kangaroo**, as requested. This is an experimental fork, not a claim of compatibility with every game or rendering pipeline.
 
-## Environment
+## XP 0.2 (upstream v2.5 sync)
+
+XP 0.2 replays the fork's changes on upstream D7VK v2.5 (`9fb6a2d50`). The checks below were repeated on that source; the XP 0.1 results further down were obtained on the older base and are kept as history, not as proof for 0.2.
+
+### Environment
+
+- AMD Radeon RX 6700 XT, RADV / Mesa 26.2.7; Lutris Wine 11.15 amd64 runner.
+- Headless `gamescope` 3.16.31 session with its own Xwayland and a 2560×1440 Wine virtual desktop, so nothing was displayed on or sent to the real desktop. Input through XTEST, screenshots through X11 `GetImage`.
+- A temporary copy of the 32-bit game (D3D6 renderer, application configuration 1920×1080 windowed) in a throwaway Wine prefix. The installed game, its prefix, configuration and saves were not touched.
+- LLVM-MinGW 20261006 / Clang 23.1.3; release builds for x86 and x64.
+
+### Build and source checks
+
+Both architectures build `ddraw.dll`, `d3d8.dll`, `d3d9.dll`, `d3d10core.dll`, `d3d11.dll` and `dxgi.dll` from the synced source. The graphics-options unit test passes under Wine in both architectures. `git diff --check` and `bash -n package-release.sh` pass. A patch-level comparison (`git range-diff`) of the original XP 0.1 commit against the replayed commit shows every added line carried over, apart from the conflict resolutions listed in [CHANGELOG-XP.md](CHANGELOG-XP.md).
+
+### Game checks
+
+| Path / settings | Observed result |
+| --- | --- |
+| DDraw → Vulkan; no `d7vk.*` settings | Intro skips, main menu renders at the application's 1920×1080. No override lines and no errors in the log. |
+| DDraw; 2560×1440, MSAA8, AF16 (the Kao preset) | Main menu, save-selection map and a loaded level render; movement and jumping respond. Log shows 1920×1080 logical → 2560×1440 physical, 8-sample color/depth attachments and AF16 sampler state. No errors logged. |
+| DDraw; bilinear mip generation, MSAA4, depth32, preserve point filtering | Menu renders. Log confirms 4 samples and 27 added mip tails, including 256×256 textures extended from 1 to 9 levels. |
+| DDraw; point mip generation, MSAA2, 2× resolution, forced vSync, depth24 | Menu renders. Log shows 3840×2160 rasterization, 2-sample attachments and FIFO presentation (the other runs use IMMEDIATE). Minimum-24-bit depth uses D32 on this GPU. |
+| DDraw; forced centered window, MSAA off, 3× resolution, point filtering, mipmapping disabled | Complete menu in a decorated 1920×1080 window centered on the 2560×1440 desktop. Log shows 5760×3240 single-sample attachments and the point-filter override. |
+| dgVoodoo 2.87.5 with its resolution/AA/filter overrides disabled → this fork's D3D11/DXGI; 2560×1440, MSAA8, AF16, depth32, bilinear mip generation | The animated intro scene renders in its window; the Escape key did not skip it in this run, so the menu was not reached on this path. Log confirms 8× attachment MSAA with resolved shader views, AF16 samplers, 32-bit depth, 2560×1440 scene scaling and 175 generated mip tails. The only errors are DXGI EDID/colorimetry messages, expected without a monitor. |
+
+### Limits of the 0.2 validation
+
+Only the 32-bit game was run; the x64 DLLs and the D3D8/9/10 frontends were compiled, not exercised. The run is a short smoke test (intro skip, main menu, save map, one level, a few seconds of movement), not a playthrough or benchmark. Because the session is headless and uses a Wine virtual desktop, exclusive fullscreen, the refresh-rate override, real monitor mode switching and behaviour on the KDE Wayland desktop were **not** re-tested for 0.2. Upstream's new adapter-group and arm64x paths were not exercised. No Windows runtime test.
+
+## XP 0.1
+
+### Environment
 
 - Linux KDE Wayland/Xwayland; AMD Radeon RX 6700 XT.
 - RADV, Mesa 26.2.4; Lutris Wine 11.15 amd64 runner.
@@ -10,13 +42,13 @@ Validation is limited to **Kao the Kangaroo**, as requested. This is an experime
 - Upstream source base: `d5388d4b7` from WinterSnowfall/d7vk.
 - LLVM-MinGW 20261006 / Clang 23.1.3; release builds for x86 and x64.
 
-## Build and source checks
+### Build and source checks
 
 Both architectures build `ddraw.dll`, `d3d8.dll`, `d3d9.dll`, `d3d10core.dll`, `d3d11.dll`, and `dxgi.dll`. PE architectures and exports were checked against the module definitions. Imports require Windows/UCRT libraries, with no separate MinGW C++ or threading runtime DLLs. D3D8 uses the included D3D9 DLL; D3D10Core uses D3D11 and DXGI.
 
 The graphics-options test passes under Wine in both architectures. It checks application defaults, malformed/oversized configuration, all sampler override modes, point-sampler preservation, mip disabling, generated mip availability, and modern screen-relative attachment selection. `git diff --check` and `bash -n package-release.sh` pass. Existing compiler warnings remain; the builds do not use `-Werror`.
 
-## Game checks
+### Game checks
 
 | Path / settings | Observed result |
 | --- | --- |
@@ -31,7 +63,7 @@ The graphics-options test passes under Wine in both architectures. It checks app
 
 The temporary D3D11 test uses the **same game**, not another title. Its original dgVoodoo configuration and DXVK DLLs are restored afterward. The final installed renderer is this fork's standalone DDraw DLL.
 
-## Fixes found through testing
+### Fixes found through testing
 
 - Present-timing initialization could crash inside Wine's native query even without graphics overrides. Timing is now opt-in, with additional initialization fallback checks.
 - A legacy surface copy could write 1440 physical rows into a 1080-row CPU buffer. Transfers are bounded by both surface descriptions.
@@ -39,7 +71,7 @@ The temporary D3D11 test uses the **same game**, not another title. Its original
 - Modern render-target texture atlases using integer texel addressing were corrupted by unconditional scaling. Screen-aspect matching preserves these unrelated textures while scaling scene attachments.
 - Wine's native DirectDraw uses a separate per-window fullscreen presentation rectangle; forced window mode must clear that state in addition to changing Win32 window styles.
 
-## Limits of this validation
+### Limits of this validation
 
 Only the 32-bit game was exercised; x64 and the other API frontends were compiled and reviewed. This is not a full campaign playthrough or a performance benchmark. There was no physical monitor refresh-rate measurement on the Wayland compositor and no Windows runtime test.
 

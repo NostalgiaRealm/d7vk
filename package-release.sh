@@ -115,7 +115,7 @@ if [ $opt_build_arm64x -eq 1 -o $opt_arm64x_only -eq 1 ]; then
   build_arch arm64x arm64x
 fi
 
-cp "$DXVK_SRC_DIR/dxvk.conf" "$DXVK_SRC_DIR/README.md" "$DXVK_SRC_DIR/VALIDATION.md" "$DXVK_SRC_DIR/LICENSE" "$DXVK_BUILD_DIR/"
+cp "$DXVK_SRC_DIR/dxvk.conf" "$DXVK_SRC_DIR/README.md" "$DXVK_SRC_DIR/VALIDATION.md" "$DXVK_SRC_DIR/CHANGELOG-XP.md" "$DXVK_SRC_DIR/LICENSE" "$DXVK_BUILD_DIR/"
 cp -R "$DXVK_SRC_DIR/presets" "$DXVK_BUILD_DIR/"
 
 if [ $opt_nopackage -eq 0 ]; then
